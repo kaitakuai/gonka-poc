@@ -33,9 +33,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # vLLM RC tags exist on GitHub but are NOT published to PyPI — only
+        # stable releases land on PyPI (verified 2026-06-16: index ends at
+        # 0.23.0). Keep the matrix to published-on-PyPI versions only; add
+        # new entries when 0.23.1, 0.23.2, etc. ship.
         vllm:
           - "0.23.0"
-          - "0.23.1rc0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,9 +55,8 @@ jobs:
 
       - name: Install vllm==${{ matrix.vllm }}
         # Pin vllm explicitly so the matrix entry — not the >=0.23,<0.24 range
-        # in pyproject — picks the version under test. --pre lets pip accept
-        # the rc tag for the 0.23.1rc0 entry.
-        run: python -m pip install --pre "vllm==${{ matrix.vllm }}"
+        # in pyproject — picks the version under test.
+        run: python -m pip install "vllm==${{ matrix.vllm }}"
 
       - name: Install gonka-poc with test extras
         run: python -m pip install -e ".[test]"
