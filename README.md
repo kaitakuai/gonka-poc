@@ -18,8 +18,11 @@ no source patches.
    while PoC generation is active.
 2. **PoCWorkerExtension** -- `execute_poc_forward` reachable through vLLM's
    public `collective_rpc` (replaces the previous AsyncLLM monkey-patch).
-3. **Model defaults** -- Qwen3MoeForCausalLM PoC `custom_ops` defaults
-   applied via the `vllm.general_plugins` entry point in every process.
+3. **`vllm.general_plugins` entry point** -- sets a process-local
+   `PLUGIN_LOADED` flag and installs a one-shot wrapper around
+   `vllm.entrypoints.openai.api_server.build_app` that warns when the
+   chat endpoint is unprotected (operator ran `vllm serve` instead of
+   `gonka-vllm-serve`).
 
 The sampler-stack residual (enforced-token sampling, `logprobs_mode`) is
 **not** part of this plugin -- it remains as a thin fork until vLLM grows a
@@ -216,7 +219,6 @@ src/gonka_poc/
   poc/            -- PoC v2 module (callbacks, queue, gpu_random, manager, ...)
   worker/         -- PoCWorkerExtension (collective_rpc surface)
   entrypoint/     -- gonka-vllm-serve composer + 503 gating middleware
-  models/         -- Qwen3MoE PoC custom_ops defaults
   _compat/        -- version-dispatched private-API shim (v0_23.py)
   plugin.py       -- vllm.general_plugins entry point
 tests/

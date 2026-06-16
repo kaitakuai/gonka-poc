@@ -37,12 +37,14 @@ def register() -> None:
     """vllm.general_plugins entry point. Idempotent.
 
     Tasks performed (each guarded for repeated calls):
-      1. Register PoC-aware model classes via ``vllm.ModelRegistry``.
-      2. Import side-effect modules that decorate CustomOp / PluggableLayer
-         classes with ``@<Base>.register_oot`` -- registration happens at
-         import time.
-      3. Optionally hook ``transformers.AutoConfig.register(...)`` for any
-         custom HF config class we ship.
+      1. Set the ``gonka_poc.PLUGIN_LOADED`` process-local flag so the
+         FastAPI startup hook can detect "plugin loaded but no gate
+         attached" (operator likely ran plain ``vllm serve`` instead of
+         ``gonka-vllm-serve``).
+      2. Install a one-shot warning wrapper around
+         ``vllm.entrypoints.openai.api_server.build_app`` so the same
+         gate-presence check fires for both ``vllm serve`` and our own
+         ``gonka-vllm-serve`` path.
 
     NOTE: we do NOT install the worker extension here -- that lives behind
     the ``--worker-extension-cls gonka_poc.worker.PoCWorkerExtension`` CLI
@@ -62,18 +64,6 @@ def register() -> None:
     _pkg.PLUGIN_LOADED = True
 
     try:
-        _register_models()
-    except Exception:  # pragma: no cover - defensive
-        # Per the vllm plugin contract, swallow and log. The host will also
-        # log at exception level.
-        logger.exception("gonka_poc.plugin.register: model registration failed")
-
-    try:
-        _register_custom_ops()
-    except Exception:  # pragma: no cover
-        logger.exception("gonka_poc.plugin.register: custom_ops import failed")
-
-    try:
         _install_build_app_warning_wrapper()
     except Exception:  # pragma: no cover
         logger.exception(
@@ -81,32 +71,6 @@ def register() -> None:
         )
 
     _registered = True
-
-
-def _register_models() -> None:
-    """Register / override model classes in ``vllm.ModelRegistry``.
-
-    For the PoC v2 port we currently only seed Qwen3MoeForCausalLM custom_ops
-    defaults -- we do NOT swap the model class itself (the in-tree
-    Qwen3MoeForCausalLM is still the forward we want).
-
-    If a future PoC variant needs a custom subclass, register it lazily:
-
-        from vllm import ModelRegistry
-        ModelRegistry.register_model(
-            "Qwen3MoeForCausalLM",
-            "gonka_poc.models.qwen3_moe_poc:Qwen3MoeForCausalLMPoC",
-        )
-
-    The "<module>:<class>" form avoids importing torch at plugin load time.
-    """
-    # NOTE(layer-1): if we end up shipping a Qwen3MoeForCausalLMPoC subclass,
-    # register it here. For now this is a no-op so the function still has a
-    # stable call site for tests.
-    from vllm import ModelRegistry  # deferred import
-
-    _ = ModelRegistry  # touch to assert the import path is real
-    logger.debug("gonka_poc: model registry touched (no overrides registered)")
 
 
 def _register_custom_ops() -> None:
@@ -133,9 +97,9 @@ def _install_build_app_warning_wrapper() -> None:
 
     Purpose: catch the operator footgun where ``vllm serve`` runs instead of
     ``gonka-vllm-serve``. The plugin's :func:`register` still executes (so
-    PoC custom_ops / model defaults are seeded) but no
-    ``app.state.gonka_gate`` is ever attached -- the chat endpoint would NOT
-    be 503-gated while PoC seizes the GPU.
+    ``PLUGIN_LOADED`` is set) but no ``app.state.gonka_gate`` is ever
+    attached -- the chat endpoint would NOT be 503-gated while PoC seizes
+    the GPU.
 
     We mutate the upstream module so the wrapper is in effect for both the
     bare ``vllm serve`` invocation and our own ``gonka-vllm-serve`` path
