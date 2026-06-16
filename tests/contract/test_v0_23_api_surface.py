@@ -328,6 +328,62 @@ def test_launcher_serve_http() -> None:
 
 
 # ---------------------------------------------------------------------------- #
+# SamplingParams residual-fork bridge (logprobs_mode + enforced_token_ids)
+# ---------------------------------------------------------------------------- #
+
+def test_sampling_params_has_fork_patches() -> None:
+    """Pin the residual-fork SamplingParams fields the plugin depends on.
+
+    Background -- the engine ships as ``vllm==0.23.0+gonka.sampler1``: a
+    residual fork of upstream 0.23.0 carrying 6 sampler patches
+    (poc-sampler-residual-v0.23). Two of those patches add per-request
+    ``logprobs_mode`` and ``enforced_token_ids`` fields to SamplingParams;
+    the PoC v2 mixed-mode sampling path (validator replay + logits-mode
+    selection) reads them at request admission.
+
+    Why this test belongs in the PLUGIN contract suite (not just the fork):
+        The plugin advertises ``vllm>=0.23.0,<0.24`` as its install pin.
+        ``pip install vllm==0.23.0`` (vanilla, no ``+gonka.sampler1``)
+        satisfies that pin -- and the other contract tests stay GREEN
+        against vanilla vllm 0.23, but engine startup crashes the moment
+        a request with ``logprobs_mode`` arrives. This pin catches that
+        misconfiguration BEFORE production.
+
+    Pattern: same as the residual branch's
+    ``tests/contract/test_sampler_surface.py::test_sampling_params_has_poc_fields``.
+    SamplingParams is a ``msgspec.Struct`` in v0.23, so we read
+    ``__struct_fields__`` first; we fall back to ``__annotations__`` to
+    stay forward-compatible with a future dataclass conversion.
+    """
+    pytest.importorskip("vllm")
+    mod = importlib.import_module("vllm.sampling_params")
+    cls = getattr(mod, "SamplingParams", None)
+    assert cls is not None, "vllm.sampling_params.SamplingParams missing"
+
+    # Primary: msgspec.Struct exposes the field tuple via __struct_fields__.
+    fields: set = set(getattr(cls, "__struct_fields__", ()) or ())
+    # Fallback chain: dataclass / NamedTuple / annotated class.
+    if not fields:
+        fields = set(getattr(cls, "__annotations__", {}) or {})
+    if not fields:
+        sig = inspect.signature(cls.__init__)
+        fields = {
+            name for name, p in sig.parameters.items()
+            if name != "self"
+        }
+
+    for required in ("logprobs_mode", "enforced_token_ids"):
+        assert required in fields, (
+            f"SamplingParams.{required} missing -- the installed vllm wheel "
+            f"is NOT the residual fork (0.23.0+gonka.sampler1). The plugin "
+            f"contract tests stay green against vanilla 0.23 but the engine "
+            f"WILL crash at request time. Install via "
+            f"`pip install vllm==0.23.0+gonka.sampler1` (or the residual "
+            f"wheel built from branch poc-sampler-residual-v0.23)."
+        )
+
+
+# ---------------------------------------------------------------------------- #
 # OpenAIServingChat export (RESTRUCTURED in v0.23)
 # ---------------------------------------------------------------------------- #
 
