@@ -174,3 +174,199 @@ def test_model_registry_register_model() -> None:
     registry = getattr(vllm, "ModelRegistry", None)
     assert registry is not None, "vllm.ModelRegistry not re-exported -- plugin needs revision."
     assert hasattr(registry, "register_model"), "ModelRegistry.register_model missing."
+
+
+# ---------------------------------------------------------------------------- #
+# Distributed group getters
+# ---------------------------------------------------------------------------- #
+
+def test_distributed_groups_present() -> None:
+    """PoCWorkerExtension uses these for the inter-rank PoC dispatch flow.
+
+    ``get_tp_group`` / ``get_pp_group`` live in
+    ``vllm.distributed.parallel_state`` and are re-exported from the package
+    root via ``vllm.distributed`` (``from .parallel_state import *``). The
+    plugin imports the short path -- pin both surfaces so a re-shuffle that
+    drops the re-export breaks here, not at runtime.
+    """
+    pytest.importorskip("vllm")
+    mod = importlib.import_module("vllm.distributed")
+    for name in ("get_pp_group", "get_tp_group"):
+        fn = getattr(mod, name, None)
+        assert fn is not None and callable(fn), (
+            f"vllm.distributed.{name} missing or non-callable -- "
+            f"gonka_poc._compat.v0_23 must reroute via "
+            f"vllm.distributed.parallel_state."
+        )
+        # Both are zero-arg getters returning a GroupCoordinator. If a
+        # future minor introduces required args, the compat shim must wrap.
+        sig = inspect.signature(fn)
+        required = [
+            p for p in sig.parameters.values()
+            if p.default is inspect.Parameter.empty
+            and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        ]
+        assert not required, (
+            f"vllm.distributed.{name} acquired required args {required!r}; "
+            f"PoCWorkerExtension call site needs revision."
+        )
+
+
+# ---------------------------------------------------------------------------- #
+# broadcast_tensor_dict fast-path
+# ---------------------------------------------------------------------------- #
+
+def test_communication_op_broadcast() -> None:
+    """Optional fast-path for PoC payload broadcast across the TP group.
+
+    Absence here means PoCWorkerExtension must fall back to
+    ``get_tp_group().broadcast_tensor_dict(...)`` directly. We still pin the
+    free-function form so a future rename forces a compat-shim review.
+    """
+    pytest.importorskip("vllm")
+    mod = importlib.import_module("vllm.distributed.communication_op")
+    fn = getattr(mod, "broadcast_tensor_dict", None)
+    assert fn is not None and callable(fn), (
+        "vllm.distributed.communication_op.broadcast_tensor_dict missing -- "
+        "compat shim needs update (fallback: get_tp_group().broadcast_tensor_dict)."
+    )
+    sig = inspect.signature(fn)
+    # In v0.23 the signature is (tensor_dict=None, src=0). The plugin passes
+    # both positionally; pin the parameter names to catch a kwarg rename.
+    params = list(sig.parameters)
+    assert params[:2] == ["tensor_dict", "src"], (
+        f"broadcast_tensor_dict signature changed: {params!r}; "
+        f"compat shim needs update."
+    )
+
+
+# ---------------------------------------------------------------------------- #
+# set_forward_context contextmanager
+# ---------------------------------------------------------------------------- #
+
+def test_forward_context_set() -> None:
+    """PoC forward needs to enter a forward context bearing AttentionMetadata.
+
+    ``vllm.forward_context.set_forward_context`` is a ``@contextmanager``
+    accepting ``(attn_metadata, vllm_config, ...)``. Pin both required
+    parameters so a future split (e.g., into ``begin_forward`` /
+    ``end_forward``) is caught here.
+    """
+    pytest.importorskip("vllm")
+    mod = importlib.import_module("vllm.forward_context")
+    fn = getattr(mod, "set_forward_context", None)
+    assert fn is not None and callable(fn), (
+        "vllm.forward_context.set_forward_context missing -- "
+        "compat shim needs update."
+    )
+    sig = inspect.signature(fn)
+    params = list(sig.parameters)
+    for required in ("attn_metadata", "vllm_config"):
+        assert required in params, (
+            f"set_forward_context lost parameter {required!r}; "
+            f"present = {params!r}; compat shim needs update."
+        )
+
+
+# ---------------------------------------------------------------------------- #
+# IntermediateTensors (PP>1 PoC)
+# ---------------------------------------------------------------------------- #
+
+def test_intermediate_tensors() -> None:
+    """PP > 1 PoC may pass / receive IntermediateTensors between stages.
+
+    In v0.23 it lives at ``vllm.sequence.IntermediateTensors`` as a
+    ``@dataclass`` with a single field ``tensors: dict[str, torch.Tensor]``.
+    If a future minor relocates it (likely candidates:
+    ``vllm.v1.outputs`` or ``vllm.v1.sequence``), this test fails and the
+    compat shim must add a fallback import path.
+    """
+    pytest.importorskip("vllm")
+    mod = importlib.import_module("vllm.sequence")
+    cls = getattr(mod, "IntermediateTensors", None)
+    assert cls is not None, (
+        "vllm.sequence.IntermediateTensors missing -- "
+        "try vllm.v1.outputs or vllm.v1.sequence and update the compat shim."
+    )
+    # Pin the dataclass field name; a rename of ``tensors`` would break the
+    # PP-stage hand-off in PoCWorkerExtension.
+    annotations = getattr(cls, "__annotations__", {}) or {}
+    assert "tensors" in annotations, (
+        f"IntermediateTensors field set changed: {sorted(annotations)!r}; "
+        f"compat shim needs update."
+    )
+
+
+# ---------------------------------------------------------------------------- #
+# launcher.serve_http
+# ---------------------------------------------------------------------------- #
+
+def test_launcher_serve_http() -> None:
+    """``gonka-vllm-serve`` composition calls ``serve_http`` directly.
+
+    Confirmed at ``vllm.entrypoints.launcher.serve_http`` in v0.23 -- an
+    ``async def`` taking ``(app, sock, enable_ssl_refresh=False, **uvicorn_kwargs)``.
+    If a future minor inlines it back into ``api_server`` or renames it to
+    ``_serve_http``, this test fires.
+    """
+    pytest.importorskip("vllm")
+    mod = importlib.import_module("vllm.entrypoints.launcher")
+    fn = getattr(mod, "serve_http", None)
+    assert fn is not None and callable(fn), (
+        "vllm.entrypoints.launcher.serve_http missing -- "
+        "gonka_poc.entrypoint.api_router._run_server needs revision."
+    )
+    assert inspect.iscoroutinefunction(fn), (
+        "serve_http is no longer a coroutine -- await-site needs revision."
+    )
+    sig = inspect.signature(fn)
+    params = list(sig.parameters)
+    # The plugin passes `app` and `sock` positionally; pin the leading pair.
+    assert params[:2] == ["app", "sock"], (
+        f"serve_http signature drifted: {params!r}; compat shim needs update."
+    )
+
+
+# ---------------------------------------------------------------------------- #
+# OpenAIServingChat export (RESTRUCTURED in v0.23)
+# ---------------------------------------------------------------------------- #
+
+def test_openai_serving_chat_export() -> None:
+    """PoC gating middleware needs an OpenAIServingChat handle to abort
+    in-flight requests.
+
+    NOTE -- v0.23 restructure: ``vllm.entrypoints.openai.serving_chat`` no
+    longer exists. The class moved to
+    ``vllm.entrypoints.openai.chat_completion.serving.OpenAIServingChat``.
+    The ``chat_completion`` package's ``__init__.py`` does NOT re-export
+    the symbol, so the compat shim MUST import from the deep path.
+    """
+    pytest.importorskip("vllm")
+
+    # The pre-0.23 path is gone -- assert that explicitly so a future
+    # vllm bump that *restores* the alias surfaces here and lets us
+    # simplify the compat shim.
+    try:
+        legacy = importlib.import_module("vllm.entrypoints.openai.serving_chat")
+    except ImportError:
+        legacy = None
+    if legacy is not None and hasattr(legacy, "OpenAIServingChat"):
+        # Legacy path restored -- compat shim can drop the deep-path fallback.
+        return
+
+    mod = importlib.import_module("vllm.entrypoints.openai.chat_completion.serving")
+    cls = getattr(mod, "OpenAIServingChat", None)
+    assert cls is not None and inspect.isclass(cls), (
+        "OpenAIServingChat not found at "
+        "vllm.entrypoints.openai.chat_completion.serving -- "
+        "the compat shim must search a new path "
+        "(check vllm.entrypoints.openai.chat_completion.__init__ for re-exports)."
+    )
+    # Pin a method the gating middleware depends on for response handling.
+    # ``create_chat_completion`` is the documented entry point; if a future
+    # version renames it (e.g., ``handle_chat_request``), the middleware
+    # wrapper must follow.
+    assert hasattr(cls, "create_chat_completion"), (
+        "OpenAIServingChat.create_chat_completion missing -- "
+        "gonka_poc gating middleware needs revision."
+    )
