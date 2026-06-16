@@ -138,7 +138,9 @@ def _get_or_create_attn_metadata(batch_size, seq_len, block_size, device, worker
     return _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker)
 
 
-# TODO: Should we get rid of this apprach?
+# NOTE(layer-1): revisit whether this KV-scratch reuse helper is still needed
+# once the layer-1 port stabilises; the v0.23 backends may handle scratch
+# allocation differently from the v0.15 fork this was lifted from.
 def _select_poc_kv_scratch(
     kv_caches: list,
     dtype: torch.dtype,

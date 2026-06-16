@@ -59,12 +59,12 @@ class PoCWorkerExtension:
         Called once from the API server at startup via
         ``collective_rpc("execute_poc_install")`` BEFORE any inference traffic.
 
-        TODO(layer-2): wire to :mod:`gonka_poc.poc.poc_model_runner` install
+        NOTE(layer-2): wire to :mod:`gonka_poc.poc.poc_model_runner` install
         hook once the compat shim ``gonka_poc._compat.v0_23`` is settled
         (depends on the CommonAttentionMetadata constructor signature
         captured by ``tests/contract/test_v0_23_api_surface.py``).
         """
-        # TODO(hardware-validation): exercise on a real GPU worker and confirm
+        # NOTE(hardware-validation): exercise on a real GPU worker and confirm
         # the model_runner.execute_model attribute is the right rebind point in
         # vLLM 0.23 (the v0.15 PoC fork patched a different symbol).
         return {"installed": False, "reason": "stub"}
@@ -101,7 +101,7 @@ class PoCWorkerExtension:
             self.model_runner.model           -- nn.Module forward target
             self.model_runner.attn_metadata_builders -- for CommonAttentionMetadata
         """
-        # TODO(layer-1): port the body of vllm/poc/poc_model_runner.py
+        # NOTE(layer-1): port the body of vllm/poc/poc_model_runner.py
         # ``run_forward`` here. The current implementation in
         # ``gonka_poc.poc.poc_model_runner`` still references upstream
         # private symbols; the compat shim in
@@ -124,9 +124,10 @@ class PoCWorkerExtension:
         #     )
         #     return {"artifacts": artifacts, "rank": int(self.rank), ...}
         raise NotImplementedError(
-            "execute_poc_forward: TODO -- wire to gonka_poc.poc.poc_model_runner "
-            "via gonka_poc._compat.v0_23 once contract test pins the "
-            "CommonAttentionMetadata constructor for the installed vllm version."
+            "execute_poc_forward: not yet wired to gonka_poc.poc.poc_model_runner. "
+            "Pending layer-1 port via gonka_poc._compat.v0_23 once the contract "
+            "test pins the CommonAttentionMetadata constructor for the installed "
+            "vllm version."
         )
 
     # ------------------------------------------------------------------ #

@@ -12,7 +12,6 @@ mapping in ``gonka_poc/_compat/__init__.py``.
 from __future__ import annotations
 
 import logging
-import warnings
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -217,32 +216,6 @@ async def abort_all_requests(engine_client: Any) -> int:
                 "abort_all_requests: abort(%s) failed: %s", rid, exc
             )
     return aborted
-
-
-# ---------------------------------------------------------------------------- #
-# Model runner forward bind (DEFERRED-BY-DESIGN)
-# ---------------------------------------------------------------------------- #
-
-def install_model_runner_forward_hook(model_runner: Any, hook: Any) -> None:
-    """Deprecated no-op -- kept for import compatibility.
-
-    The PoC v2 architecture on 0.23 invokes ``PoCWorkerExtension.execute_poc_forward``
-    out-of-band via ``collective_rpc``; it does NOT intercept the per-step
-    serving forward. This hook is therefore deferred-by-design.
-
-    If a future architecture revision needs per-step interception, restore an
-    implementation that rebinds ``GPUModelRunner.execute_model`` and add a
-    contract test (``tests/contract/test_v0_23_api_surface.py::
-    test_execute_model_signature``) that pins the upstream signature.
-    """
-    warnings.warn(
-        "install_model_runner_forward_hook is a deferred-by-design no-op on "
-        "vllm 0.23.x (PoC v2 uses out-of-band collective_rpc, not per-step "
-        "forward interception). Calling this function has no effect.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return None
 
 
 __all__ = [
