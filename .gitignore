@@ -1,0 +1,47 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+
+# venvs
+.venv/
+venv/
+env/
+ENV/
+
+# tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# IDE
+.idea/
+.vscode/
+
+# editor
+*.swp
+*~
+.DS_Store

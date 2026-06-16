@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gonka-poc"
+version = "0.1.0a0"
+description = "Out-of-tree vLLM plugin for Gonka Proof-of-Compute v2 (vllm 0.23.x)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Kaitaku.ai" }]
+keywords = ["vllm", "gonka", "proof-of-compute", "llm", "plugin"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+  "vllm>=0.23.0,<0.24",
+  "torch",
+  "numpy",
+  "fastapi<0.137",
+  "pydantic>=2",
+  "starlette",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7",
+  "pytest-asyncio",
+  "httpx",
+]
+
+[project.entry-points."vllm.general_plugins"]
+gonka_poc = "gonka_poc.plugin:register"
+
+[project.scripts]
+gonka-vllm-serve = "gonka_poc.entrypoint.api_router:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["gonka_poc*"]
+
+[tool.setuptools.package-data]
+"gonka_poc" = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+  "live: requires a running vllm server (skipped by default in CI without GPU)",
+  "contract: read-only vllm API drift detector",
+]
