@@ -328,6 +328,77 @@ def test_launcher_serve_http() -> None:
 
 
 # ---------------------------------------------------------------------------- #
+# SamplingParams residual-fork bridge (logprobs_mode + enforced_token_ids)
+# ---------------------------------------------------------------------------- #
+
+def test_sampling_params_has_fork_patches() -> None:
+    """Pin the residual-fork SamplingParams fields the plugin depends on.
+
+    Background -- the engine ships as ``vllm==0.23.0+gonka.sampler1``: a
+    residual fork of upstream 0.23.0 carrying 6 sampler patches
+    (poc-sampler-residual-v0.23). Two of those patches add per-request
+    ``logprobs_mode`` and ``enforced_token_ids`` fields to SamplingParams;
+    the PoC v2 mixed-mode sampling path (validator replay + logits-mode
+    selection) reads them at request admission.
+
+    Why this test belongs in the PLUGIN contract suite (not just the fork):
+        The plugin advertises ``vllm>=0.23.0,<0.24`` as its install pin.
+        ``pip install vllm==0.23.0`` (vanilla, no ``+gonka.sampler1``)
+        satisfies that pin -- and the other contract tests stay GREEN
+        against vanilla vllm 0.23, but engine startup crashes the moment
+        a request with ``logprobs_mode`` arrives. This pin catches that
+        misconfiguration BEFORE production.
+
+    Pattern: same as the residual branch's
+    ``tests/contract/test_sampler_surface.py::test_sampling_params_has_poc_fields``.
+    SamplingParams is a ``msgspec.Struct`` in v0.23, so we read
+    ``__struct_fields__`` first; we fall back to ``__annotations__`` to
+    stay forward-compatible with a future dataclass conversion.
+    """
+    vllm = pytest.importorskip("vllm")
+    # Default CI installs `vllm==0.23.0` (vanilla, no +gonka.sampler1) for
+    # all the OTHER contract tests in this file — those test the upstream
+    # surface and should stay green there. THIS test only meaningfully runs
+    # when a residual wheel is installed; on vanilla vllm it would fail
+    # loudly with no actionable signal (the operator running CI is not the
+    # same as the operator deploying production). Skip-with-clear-message
+    # so the test serves as a runtime alert (visible in pytest -v output)
+    # without polluting the CI failure surface.
+    version = getattr(vllm, "__version__", "")
+    if "+gonka.sampler" not in version:
+        pytest.skip(
+            f"vllm=={version!r} is the vanilla upstream wheel; this test "
+            f"requires the kaitakuai residual wheel (vllm==0.23.0+gonka.sampler1). "
+            f"Production deployments MUST install the residual wheel — see "
+            f"MIGRATION_FROM_FORK.md. CI exercises this assertion via the "
+            f"poc-sampler-residual-v0.23 branch's own contract suite."
+        )
+
+    mod = importlib.import_module("vllm.sampling_params")
+    cls = getattr(mod, "SamplingParams", None)
+    assert cls is not None, "vllm.sampling_params.SamplingParams missing"
+
+    # Primary: msgspec.Struct exposes the field tuple via __struct_fields__.
+    fields: set = set(getattr(cls, "__struct_fields__", ()) or ())
+    # Fallback chain: dataclass / NamedTuple / annotated class.
+    if not fields:
+        fields = set(getattr(cls, "__annotations__", {}) or {})
+    if not fields:
+        sig = inspect.signature(cls.__init__)
+        fields = {
+            name for name, p in sig.parameters.items()
+            if name != "self"
+        }
+
+    for required in ("logprobs_mode", "enforced_token_ids"):
+        assert required in fields, (
+            f"SamplingParams.{required} missing despite vllm version {version!r} "
+            f"claiming to be the residual wheel — patch regression. Re-check "
+            f"commit 1c5368212 application on poc-sampler-residual-v0.23."
+        )
+
+
+# ---------------------------------------------------------------------------- #
 # OpenAIServingChat export (RESTRUCTURED in v0.23)
 # ---------------------------------------------------------------------------- #
 

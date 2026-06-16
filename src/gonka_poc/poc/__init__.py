@@ -1,37 +1,16 @@
-# Apply PoC engine patch for vLLM 0.15.1 V1 engine
-from . import engine_patch
+"""PoC sub-package.
 
-from .config import PoCConfig, PoCState
-from .data import (
-    PoCParams,
-    Artifact,
-    Encoding,
-    ArtifactBatch,
-    ValidationResult,
-    encode_vector,
-    decode_vector,
-    is_mismatch,
-    fraud_test,
-    compare_artifacts,
-)
-from .manager import PoCManager
-from .routes import router as poc_router
-from .layer_hooks import LayerHouseholderHook
+Intentionally inert: importing ``gonka_poc.poc`` MUST NOT trigger any
+side effects (no engine patching, no router registration, no model
+imports). Each consumer pulls what it needs from the explicit module
+path, e.g.::
 
-__all__ = [
-    "PoCConfig",
-    "PoCState",
-    "PoCParams",
-    "Artifact",
-    "Encoding",
-    "ArtifactBatch",
-    "ValidationResult",
-    "encode_vector",
-    "decode_vector",
-    "is_mismatch",
-    "fraud_test",
-    "compare_artifacts",
-    "PoCManager",
-    "poc_router",
-    "LayerHouseholderHook",
-]
+    from gonka_poc.poc.routes import router as poc_router
+    from gonka_poc.poc.data import encode_vector, decode_vector
+    from gonka_poc.poc.poc_model_runner import execute_poc_forward
+
+The previous version eagerly imported engine_patch (which monkey-patched
+AsyncLLM.poc_request) and manager (V0-only PoCManager). Both are removed:
+PoC dispatch is now via ``collective_rpc("execute_poc_forward", kwargs=...)``
+on :class:`gonka_poc.worker.PoCWorkerExtension`.
+"""

@@ -8,6 +8,21 @@ Every function below touches a vLLM private surface. Each docstring records:
 If any of these shift in a future vLLM minor, copy this file to
 ``v0_24.py``, edit the relevant function, and register the new dispatch
 mapping in ``gonka_poc/_compat/__init__.py``.
+
+CommonAttentionMetadata import-path policy
+------------------------------------------
+v0.23 exposes ``CommonAttentionMetadata`` at TWO paths:
+
+  * ``vllm.v1.attention.backends.utils`` — canonical declaration site.
+  * ``vllm.v1.attention.backend``       — convenience re-export.
+
+We import from the canonical ``vllm.v1.attention.backends.utils`` path
+because that is the one pinned by
+``tests/contract/test_v0_23_api_surface.py::test_common_attention_metadata_fields``
+(the contract test verifies the field set at the declaration site, so the
+shim and the test must reference the same path; otherwise an upstream
+re-export removal would break the shim silently while the contract test
+stays green).
 """
 from __future__ import annotations
 
@@ -93,6 +108,65 @@ def build_common_attention_metadata(
         _seq_lens_cpu=_seq_lens_cpu,
         _num_computed_tokens_cpu=_num_computed_tokens_cpu,
     )
+
+
+# ---------------------------------------------------------------------------- #
+# Per-layer AttentionMetadata expansion (model_runner.attn_groups iteration)
+# ---------------------------------------------------------------------------- #
+
+def build_attn_metadata_per_layer(
+    model_runner: Any,
+    common_attn_metadata: Any,
+    *,
+    slot_mapping: Any,
+) -> tuple[dict, dict]:
+    """Expand ``CommonAttentionMetadata`` into per-layer ``AttentionMetadata``.
+
+    Upstream symbol: ``GPUModelRunner.attn_groups`` (list[list[AttentionGroup]])
+        declared at vllm/v1/worker/gpu_model_runner.py:530 (v0.23.0). Each
+        ``AttentionGroup`` exposes ``get_metadata_builder(index)`` and a
+        ``layer_names`` iterable; the builder's ``build(common_prefix_len,
+        common_attn_metadata)`` is the v1 entry point for materialising
+        backend-specific metadata (FlashAttention / FlashInfer / MLA).
+
+    Version constraint: vllm == 0.23.*
+
+    Contract test:
+        tests/contract/test_v0_23_api_surface.py::test_kv_caches_attribute
+        (covers the GPUModelRunner declaration site; attn_groups lives in
+        the same class so any reshuffle that breaks one breaks the other)
+
+    Args:
+        model_runner: live ``GPUModelRunner`` instance from the worker.
+        common_attn_metadata: result of :func:`build_common_attention_metadata`.
+        slot_mapping: GPU tensor; mirrored per layer in the returned
+            ``slot_mapping_dict`` because ``set_forward_context`` wants a dict
+            keyed by layer name.
+
+    Returns:
+        ``(attn_metadata_dict, slot_mapping_dict)`` where both are
+        ``dict[layer_name -> tensor/metadata]``. Pass straight into
+        ``set_forward_context(attn_metadata=..., slot_mapping=...)``.
+
+    Source of the iteration: fork branch ``mb/feat/port-pocv2-vllm-0.23.0``,
+    ``vllm/poc/poc_model_runner.py:118-133``. The body is copied verbatim --
+    only the GPU tensor construction (above) is the caller's responsibility.
+    """
+    attn_metadata_dict: dict = {}
+    slot_mapping_dict: dict = {}
+
+    for kv_cache_group_attn_groups in model_runner.attn_groups:
+        for attn_group in kv_cache_group_attn_groups:
+            builder = attn_group.get_metadata_builder(0)
+            metadata = builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+            )
+            for layer_name in attn_group.layer_names:
+                attn_metadata_dict[layer_name] = metadata
+                slot_mapping_dict[layer_name] = slot_mapping
+
+    return attn_metadata_dict, slot_mapping_dict
 
 
 # ---------------------------------------------------------------------------- #
@@ -220,6 +294,7 @@ async def abort_all_requests(engine_client: Any) -> int:
 
 __all__ = [
     "build_common_attention_metadata",
+    "build_attn_metadata_per_layer",
     "get_kv_cache_pool",
     "abort_all_requests",
 ]
