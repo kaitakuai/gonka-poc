@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -27,12 +27,69 @@ POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
 POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "32"))
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
-_poc_generation_active: bool = False
 
 
-def is_poc_generation_active() -> bool:
-    """Check if POC generation is active (for use by chat endpoint to reject requests)."""
-    return _poc_generation_active
+async def _execute_poc_forward_rpc(
+    engine_client: Any,
+    *,
+    nonces: List[int],
+    block_hash: str,
+    public_key: str,
+    seq_len: int,
+    k_dim: int,
+    poc_stronger_rng: bool = False,
+    timeout_ms: int = POC_RPC_TIMEOUT_MS,
+) -> Dict[str, Any]:
+    """Run ``execute_poc_forward`` on every worker rank and aggregate.
+
+    Uses ``EngineClient.collective_rpc`` (vllm/engine/protocol.py) to invoke
+    :meth:`gonka_poc.worker.PoCWorkerExtension.execute_poc_forward` on each
+    rank. Each rank returns ``{"artifacts": [...], "rank": int}``;
+    PP non-last ranks return an empty list. We aggregate the union (in
+    practice only the PP last rank produces non-empty artifacts, but a
+    union is safe and handles non-PP topologies uniformly).
+
+    Args / kwargs mirror what ``PoCWorkerExtension.execute_poc_forward``
+    accepts. The vectors are already base64-encoded FP16 in the per-rank
+    result; we do not need to decode here -- the API response forwards the
+    ``vector_b64`` strings unchanged.
+
+    Returns: ``{"artifacts": [{"nonce": int, "vector_b64": str}, ...]}``.
+    """
+    if not nonces:
+        return {"artifacts": []}
+
+    timeout_sec = timeout_ms / 1000.0
+    results = await engine_client.collective_rpc(
+        "execute_poc_forward",
+        timeout=timeout_sec,
+        kwargs={
+            "block_hash": block_hash,
+            "public_key": public_key,
+            "nonces": list(nonces),
+            "seq_len": int(seq_len),
+            "k_dim": int(k_dim),
+            "poc_stronger_rng": bool(poc_stronger_rng),
+        },
+    )
+
+    # Aggregate per-rank artifacts. In a PP topology only the last rank
+    # populates artifacts; in TP-only it's typically the driver rank
+    # (whichever ran the forward to completion). De-duplicate by nonce so a
+    # buggy worker that doubles up doesn't corrupt the API response.
+    seen: set = set()
+    artifacts: List[Dict[str, Any]] = []
+    for rank_result in results:
+        if not rank_result:
+            continue
+        for art in rank_result.get("artifacts", []) or []:
+            nonce = art.get("nonce")
+            if nonce is None or nonce in seen:
+                continue
+            seen.add(nonce)
+            artifacts.append(art)
+
+    return {"artifacts": artifacts}
 
 
 # =============================================================================
@@ -233,32 +290,28 @@ async def _compute_artifacts_chunk(
     k_dim: int,
     poc_stronger_rng: bool = False,
     timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
-    check_cancelled: Optional[Callable[[], bool]] = None,
+    check_cancelled: Optional[callable] = None,
 ) -> List[Dict]:
-    """Compute artifacts for a chunk with backoff on skip."""
-    chunk_start_time = time.time()
-    
-    while True:
-        if check_cancelled and check_cancelled():
-            raise RuntimeError("Cancelled")
-        
-        result = await engine_client.poc_request("generate_artifacts", {
-            "nonces": nonces,
-            "block_hash": block_hash,
-            "public_key": public_key,
-            "seq_len": seq_len,
-            "k_dim": k_dim,
-            "poc_stronger_rng": poc_stronger_rng,
-        })
-        
-        if not result.get("skipped"):
-            return result.get("artifacts", [])
-        
-        elapsed = time.time() - chunk_start_time
-        if elapsed >= timeout_sec:
-            raise RuntimeError(f"Timeout after {elapsed:.1f}s")
-        
-        await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
+    """Compute artifacts for a chunk via collective_rpc.
+
+    There is no longer a "skipped" backoff path: PoCGatingMiddleware blocks
+    new inference admission while PoC is active, so the GPU is exclusively
+    ours by the time we reach this call.
+    """
+    if check_cancelled and check_cancelled():
+        raise RuntimeError("Cancelled")
+
+    result = await _execute_poc_forward_rpc(
+        engine_client,
+        nonces=nonces,
+        block_hash=block_hash,
+        public_key=public_key,
+        seq_len=seq_len,
+        k_dim=k_dim,
+        poc_stronger_rng=poc_stronger_rng,
+        timeout_ms=int(timeout_sec * 1000),
+    )
+    return result.get("artifacts", [])
 
 
 # =============================================================================
@@ -285,52 +338,34 @@ async def _generation_loop(
     stats["total_processed"] = 0
     last_report_time = start_time
     
-    logger.info(
-        "PoC generation started (node %s/%s, group %s/%s)",
-        config["node_id"],
-        config["node_count"],
-        config["group_id"],
-        config["n_groups"],
-    )
-    skip_count = 0
+    logger.info(f"PoC generation started (node {config['node_id']}/{config['node_count']}, group {config['group_id']}/{config['n_groups']})")
     timeout_count = 0
     pending_nonces = None
-    
+
     try:
         while not stop_event.is_set():
             nonces = pending_nonces if pending_nonces else nonce_iter.take(batch_size)
-            
+
             try:
-                result = await engine_client.poc_request(
-                    "generate_artifacts",
-                    {
-                        "nonces": nonces,
-                        "block_hash": config["block_hash"],
-                        "public_key": config["public_key"],
-                        "seq_len": config["seq_len"],
-                        "k_dim": config["k_dim"],
-                        "poc_stronger_rng": config["poc_stronger_rng"],
-                    },
-                    timeout_ms=POC_RPC_TIMEOUT_MS
+                result = await _execute_poc_forward_rpc(
+                    engine_client,
+                    nonces=nonces,
+                    block_hash=config["block_hash"],
+                    public_key=config["public_key"],
+                    seq_len=config["seq_len"],
+                    k_dim=config["k_dim"],
+                    poc_stronger_rng=config["poc_stronger_rng"],
+                    timeout_ms=POC_RPC_TIMEOUT_MS,
                 )
                 timeout_count = 0
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
                 timeout_count += 1
                 if timeout_count == 1 or timeout_count % 10 == 0:
-                    logger.warning("PoC timed out (#%s), engine busy", timeout_count)
+                    logger.warning(f"PoC timed out (#{timeout_count}), engine busy")
                 pending_nonces = nonces
                 await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC * 2)
                 continue
-            
-            if result.get("skipped"):
-                skip_count += 1
-                if skip_count % 100 == 1:
-                    logger.debug("PoC yielding to chat (skip #%s)", skip_count)
-                pending_nonces = nonces
-                await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
-                continue
-            
-            skip_count = 0
+
             pending_nonces = None
             artifacts = result.get("artifacts", [])
             
@@ -349,22 +384,14 @@ async def _generation_loop(
             if current_time - last_report_time >= 5.0:
                 elapsed_min = (current_time - start_time) / 60
                 rate = stats["total_processed"] / elapsed_min if elapsed_min > 0 else 0
-                logger.info(
-                    "Generated: %s nonces (%.0f/min)",
-                    stats["total_processed"],
-                    rate,
-                )
+                logger.info(f"Generated: {stats['total_processed']} nonces ({rate:.0f}/min)")
                 last_report_time = current_time
-
+            
     except asyncio.CancelledError:
         elapsed_min = (time.time() - start_time) / 60
-        logger.info(
-            "PoC stopped: %s nonces in %.2fmin",
-            stats["total_processed"],
-            elapsed_min,
-        )
+        logger.info(f"PoC stopped: {stats['total_processed']} nonces in {elapsed_min:.2f}min")
     except Exception as e:
-        logger.error("PoC generation crashed: %s", e, exc_info=True)
+        logger.error(f"PoC generation crashed: {e}", exc_info=True)
         raise
 
 
@@ -372,26 +399,39 @@ async def _generation_loop(
 # API Endpoints
 # =============================================================================
 
+def _get_gate(request: Request):
+    """Return the per-app PoCGate.
+
+    The gate is installed on ``app.state.gonka_gate`` by
+    :func:`gonka_poc.entrypoint.api_router.build_gonka_app`. If it's
+    missing the API server was not composed via that helper -- raise
+    500 so the operator notices the wiring bug immediately.
+    """
+    gate = getattr(request.app.state, "gonka_gate", None)
+    if gate is None:
+        raise HTTPException(
+            status_code=500,
+            detail="PoCGate not installed on app.state.gonka_gate "
+            "(gonka_poc.entrypoint.api_router.build_gonka_app must run "
+            "before the PoC router accepts traffic).",
+        )
+    return gate
+
+
 @router.post("/init/generate")
 async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
-    global _poc_generation_active
-    # Do NOT log the full body (public_key, callback url, params are sensitive
-    # or noisy). Stick to a stable identity pair: node and batch size.
-    logger.info(
-        "PoC /init/generate: node_id=%s, batch_size=%s",
-        body.node_id,
-        body.batch_size,
-    )
+    logger.info(f"PoC /init/generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.group_id}, {body.n_groups}, {body.batch_size}, {body.params}, {body.url}, {body.poc_stronger_rng}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
+    gate = _get_gate(request)
 
     app_id = id(request.app)
 
     if _is_generation_active(app_id):
         raise HTTPException(status_code=409, detail="Already generating")
-    
+
     await _cancel_poc_tasks(app_id)
-    
+
     config = {
         "block_hash": body.block_hash,
         "block_height": body.block_height,
@@ -405,36 +445,36 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
         "k_dim": body.params.k_dim,
         "poc_stronger_rng": body.poc_stronger_rng,
     }
-    
+
     stats = {"start_time": 0, "total_processed": 0}
     stop_event = asyncio.Event()
-    
+
     callback_sender = None
     callback_task = None
     if body.url:
         callback_sender = CallbackSender(body.url, stop_event, body.params.k_dim)
         callback_task = asyncio.create_task(callback_sender.run())
-    
-    # Set the flag BEFORE creating the task so the chat endpoint starts
-    # rejecting immediately — the drain in poc_request relies on no new
-    # inference arriving while it waits.
-    _poc_generation_active = True
+
+    # Activate the gate BEFORE creating the task so PoCGatingMiddleware
+    # starts returning 503 to /v1/chat/completions and /v1/completions
+    # immediately. The gate is the single source of truth for "PoC is
+    # currently running" -- no module-level flag.
+    gate.activate("init-generate")
 
     gen_task = asyncio.create_task(
         _generation_loop(engine_client, stop_event, callback_sender, config, stats)
     )
-    
+
     def _on_generation_done(task: asyncio.Task):
-        global _poc_generation_active
-        _poc_generation_active = False
+        gate.deactivate()
         if task.cancelled():
-            logger.info("PoC generation task cancelled, flag cleared")
+            logger.info("PoC generation task cancelled, gate deactivated")
         elif task.exception():
-            logger.warning("PoC generation task failed, flag cleared: %s",
+            logger.warning("PoC generation task failed, gate deactivated: %s",
                            task.exception())
         else:
-            logger.info("PoC generation task completed, flag cleared")
-    
+            logger.info("PoC generation task completed, gate deactivated")
+
     gen_task.add_done_callback(_on_generation_done)
     
     _poc_tasks[app_id] = {
@@ -451,13 +491,7 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
 
 @router.post("/generate")
 async def generate(request: Request, body: PoCGenerateRequest) -> dict:
-    # Do NOT log the full body (nonces list can be huge, public_key/url are
-    # sensitive). Log only size + node id for traceability.
-    logger.info(
-        "PoC /generate: node_id=%s, nonces=%d",
-        body.node_id,
-        len(body.nonces),
-    )
+    logger.info(f"PoC /generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.nonces}, {body.params}, {body.batch_size}, {body.wait}, {body.url}, {body.validation}, {body.stat_test}, {body.poc_stronger_rng}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
     
@@ -518,12 +552,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     
     total_nonces = len(body.nonces)
     n_chunks = (total_nonces + body.batch_size - 1) // body.batch_size
-    logger.info(
-        "PoC /generate: %d nonces, batch_size=%d, chunks=%d",
-        total_nonces,
-        body.batch_size,
-        n_chunks,
-    )
+    logger.info(f"PoC /generate: {total_nonces} nonces, batch_size={body.batch_size}, chunks={n_chunks}")
     
     start_time = time.time()
     computed_artifacts = []
@@ -545,23 +574,13 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 POC_GENERATE_CHUNK_TIMEOUT_SEC, check_cancelled
             )
             computed_artifacts.extend(artifacts)
-            logger.debug(
-                "PoC /generate: chunk %d/%d done (%d nonces)",
-                chunk_idx + 1,
-                n_chunks,
-                len(chunk),
-            )
+            logger.debug(f"PoC /generate: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
     
     elapsed = time.time() - start_time
     rate = total_nonces / elapsed if elapsed > 0 else 0
-    logger.info(
-        "PoC /generate completed: %d nonces in %.2fs (%.0f/s)",
-        total_nonces,
-        elapsed,
-        rate,
-    )
+    logger.info(f"PoC /generate completed: {total_nonces} nonces in {elapsed:.2f}s ({rate:.0f}/s)")
     
     if not body.validation:
         return {
@@ -612,11 +631,16 @@ async def get_status(request: Request) -> dict:
 
 @router.post("/stop")
 async def stop_round(request: Request) -> dict:
-    global _poc_generation_active
     app_id = id(request.app)
 
     await _cancel_poc_tasks(app_id)
     await clear_queue()
 
-    _poc_generation_active = False
+    # Deactivate the gate after task cancellation so the chat endpoint
+    # cannot squeeze a request in between cancellation and gate clear.
+    # NOTE: the gen_task done-callback also calls deactivate(); this is
+    # idempotent (PoCGate.deactivate clears the flag unconditionally).
+    gate = getattr(request.app.state, "gonka_gate", None)
+    if gate is not None:
+        gate.deactivate()
     return {"status": "OK", "pow_status": {"status": "STOPPED"}}

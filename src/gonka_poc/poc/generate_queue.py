@@ -229,15 +229,20 @@ class GenerateQueue:
                     continue
                 
                 try:
+                    # Lazy import to avoid circular import (routes.py imports
+                    # GenerateJob/queue from this module).
+                    from .routes import _execute_poc_forward_rpc
                     result = await asyncio.wait_for(
-                        job.engine_client.poc_request("generate_artifacts", {
-                            "nonces": chunk,
-                            "block_hash": job.block_hash,
-                            "public_key": job.public_key,
-                            "seq_len": job.seq_len,
-                            "k_dim": job.k_dim,
-                            "poc_stronger_rng": job.poc_stronger_rng,
-                        }),
+                        _execute_poc_forward_rpc(
+                            job.engine_client,
+                            nonces=chunk,
+                            block_hash=job.block_hash,
+                            public_key=job.public_key,
+                            seq_len=job.seq_len,
+                            k_dim=job.k_dim,
+                            poc_stronger_rng=job.poc_stronger_rng,
+                            timeout_ms=int(POC_GENERATE_CHUNK_TIMEOUT_SEC * 1000),
+                        ),
                         timeout=POC_GENERATE_CHUNK_TIMEOUT_SEC
                     )
                 except asyncio.CancelledError:
@@ -245,17 +250,10 @@ class GenerateQueue:
                     raise RuntimeError("Job cancelled")
                 except asyncio.TimeoutError:
                     raise RuntimeError(f"Timeout waiting for engine RPC: chunk {chunk_idx}")
-                
-                if not result.get("skipped"):
-                    computed_artifacts.extend(result.get("artifacts", []))
-                    logger.debug(f"PoC queue job {job.request_id[:8]}: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
-                    break
-                
-                elapsed = time.time() - chunk_start_time
-                if elapsed >= POC_GENERATE_CHUNK_TIMEOUT_SEC:
-                    raise RuntimeError(f"Timeout waiting for engine: chunk {chunk_idx}")
-                
-                await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
+
+                computed_artifacts.extend(result.get("artifacts", []))
+                logger.debug(f"PoC queue job {job.request_id[:8]}: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
+                break
         
         elapsed = time.time() - start_time
         rate = total_nonces / elapsed if elapsed > 0 else 0
