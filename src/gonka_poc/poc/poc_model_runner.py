@@ -1,8 +1,32 @@
-"""PoC model runner for vLLM 0.15.x V1 architecture.
+"""PoC model runner for vLLM 0.23.x V1 architecture.
 
 Full model forward pass with proper V1 attention metadata.
 Uses actual KV cache blocks for attention to work correctly.
 Batched forward pass — processes all nonces in a single forward call.
+
+Private-API touchpoint policy
+-----------------------------
+All ``vllm.v1.*`` private surfaces are routed through the version-dispatched
+compat shim ``gonka_poc._compat.current``:
+    * ``CommonAttentionMetadata`` construction
+    * per-layer ``AttentionMetadata`` builder iteration over
+      ``model_runner.attn_groups``
+    * ``model_runner.kv_caches`` access
+
+The following vLLM imports REMAIN at module scope because they are public
+(re-exported via the package root):
+    * ``vllm.distributed.get_pp_group`` / ``get_tp_group``
+      (pinned by ``tests/contract/test_v0_23_api_surface.py::test_distributed_groups_present``)
+    * ``vllm.distributed.communication_op.broadcast_tensor_dict``
+      (pinned by ``::test_communication_op_broadcast``)
+    * ``vllm.forward_context.set_forward_context``
+      (pinned by ``::test_forward_context_set``)
+    * ``vllm.sequence.IntermediateTensors``
+      (pinned by ``::test_intermediate_tensors``)
+    * ``vllm.logger.init_logger``
+
+If a future minor reshuffles any of these into private namespaces, move
+the import into the compat shim and add a contract-test pin.
 """
 import math
 import torch
@@ -15,6 +39,8 @@ from vllm.distributed.communication_op import broadcast_tensor_dict
 from vllm.forward_context import set_forward_context
 from vllm.sequence import IntermediateTensors
 from vllm.logger import init_logger
+
+from gonka_poc._compat import current as compat
 
 from .gpu_random import (
     generate_inputs,
@@ -61,10 +87,10 @@ def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker):
 
     Uses the worker's metadata builders to create the correct metadata
     for whatever attention backend is configured (FlashAttention,
-    FlashInfer, etc.).
+    FlashInfer, etc.). All private-API touchpoints (CommonAttentionMetadata
+    constructor + per-layer builder iteration over
+    ``model_runner.attn_groups``) are routed through ``gonka_poc._compat``.
     """
-    from vllm.v1.attention.backend import CommonAttentionMetadata
-
     blocks_per_seq = math.ceil(seq_len / block_size)
     total_tokens = batch_size * seq_len
 
@@ -97,7 +123,7 @@ def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker):
         (batch_size,), seq_len, dtype=torch.int32, device="cpu"
     )
 
-    common_attn_metadata = CommonAttentionMetadata(
+    common_attn_metadata = compat.build_common_attention_metadata(
         query_start_loc=query_start_loc_gpu,
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens=seq_lens_gpu,
@@ -115,20 +141,11 @@ def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker):
         ),
     )
 
-    model_runner = worker.model_runner
-    attn_metadata_dict = {}
-    slot_mapping_dict = {}
-
-    for kv_cache_group_attn_groups in model_runner.attn_groups:
-        for attn_group in kv_cache_group_attn_groups:
-            builder = attn_group.get_metadata_builder(0)
-            metadata = builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=common_attn_metadata,
-            )
-            for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name] = metadata
-                slot_mapping_dict[layer_name] = slot_mapping
+    attn_metadata_dict, slot_mapping_dict = compat.build_attn_metadata_per_layer(
+        worker.model_runner,
+        common_attn_metadata,
+        slot_mapping=slot_mapping,
+    )
 
     return attn_metadata_dict, slot_mapping_dict
 
