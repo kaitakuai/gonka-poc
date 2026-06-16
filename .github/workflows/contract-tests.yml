@@ -62,4 +62,4 @@ jobs:
         run: python -m pip install -e ".[test]"
 
       - name: Run contract tests
-        run: pytest tests/contract -v --tb=short
+        run: pytest tests/contract tests/unit -v --tb=short
