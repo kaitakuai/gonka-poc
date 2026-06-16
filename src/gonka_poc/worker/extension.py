@@ -14,13 +14,15 @@ attributes:
     self.model_runner           -- GPUModelRunner (gpu_model_runner.py)
     self.model_runner.model     -- the nn.Module
     self.model_runner.kv_caches -- list[torch.Tensor]   (declared L525)
+    self.model_runner.attn_groups -- list[list[AttentionGroup]] (L530)
     self.device, self.rank, self.vllm_config
 
 Invocation (from the API server / async engine):
     await async_llm.collective_rpc(
         "execute_poc_forward",
         args=(),
-        kwargs={"payload": ..., ...},
+        kwargs={"block_hash": ..., "public_key": ..., "nonces": [...],
+                "seq_len": int, "k_dim": int, "poc_stronger_rng": bool},
         timeout=POC_RPC_TIMEOUT_S,
     )
 
@@ -29,17 +31,19 @@ CONTRACT WARNINGS:
   asserts ``not hasattr(worker_class, attr)`` at init_worker time. Keep the
   ``execute_poc_*`` prefix unique.
 - Return values must be msgpack-serialisable; do NOT return tensors. Return
-  digests / dicts of bytes / ints.
-- Every TP/PP rank executes the method; the API server typically uses
-  ``result[0]`` (driver). Wrap GPU work in rank-aware guards if needed.
+  digests / dicts of bytes / ints (artifacts carry vectors as base64 strings
+  via :func:`gonka_poc.poc.data.encode_vector`).
+- Every TP/PP rank executes the method; the API server aggregates results
+  across ranks (PP non-last ranks return ``{"artifacts": [], "rank": ...}``
+  because the underlying forward returns None for them).
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # NOTE: keep imports light at module scope -- this file is imported in every
-# worker process during init_worker. Heavy imports (torch, vllm.poc.*) are
-# deferred into method bodies.
+# worker process during init_worker. Heavy imports (torch, gonka_poc.poc.*)
+# are deferred into method bodies.
 
 
 class PoCWorkerExtension:
@@ -49,86 +53,96 @@ class PoCWorkerExtension:
     """
 
     # ------------------------------------------------------------------ #
-    # Lifecycle / install
-    # ------------------------------------------------------------------ #
-
-    def execute_poc_install(self) -> Dict[str, Any]:
-        """One-shot install: rebind ``model_runner.execute_model`` (or its
-        forward) if PoC needs to intercept the live serving forward.
-
-        Called once from the API server at startup via
-        ``collective_rpc("execute_poc_install")`` BEFORE any inference traffic.
-
-        NOTE(layer-2): wire to :mod:`gonka_poc.poc.poc_model_runner` install
-        hook once the compat shim ``gonka_poc._compat.v0_23`` is settled
-        (depends on the CommonAttentionMetadata constructor signature
-        captured by ``tests/contract/test_v0_23_api_surface.py``).
-        """
-        # NOTE(hardware-validation): exercise on a real GPU worker and confirm
-        # the model_runner.execute_model attribute is the right rebind point in
-        # vLLM 0.23 (the v0.15 PoC fork patched a different symbol).
-        return {"installed": False, "reason": "stub"}
-
-    # ------------------------------------------------------------------ #
     # PoC forward (the actual GPU work)
     # ------------------------------------------------------------------ #
 
     def execute_poc_forward(
         self,
-        payload: Dict[str, Any],
         *,
-        batch_size: int = 32,
-        timeout_ms: int = 60000,
+        block_hash: str,
+        public_key: str,
+        nonces: List[int],
+        seq_len: int,
+        hidden_size: Optional[int] = None,
+        k_dim: int = 12,
+        poc_stronger_rng: bool = False,
     ) -> Dict[str, Any]:
         """Execute one PoC forward pass on this worker rank.
 
         Args:
-            payload: dict with PoC params: nonces (list[int]), block_hash,
-                public_key, seq_len, k_dim, poc_stronger_rng.
-            batch_size: passes per forward.
-            timeout_ms: soft deadline; advisory only -- the engine-side
-                collective_rpc supplies the hard timeout.
+            block_hash, public_key: PoC scope tags fed into the seeded RNG.
+            nonces: list[int] of nonces to compute artifacts for; one batched
+                forward processes all of them.
+            seq_len: sequence length per nonce.
+            hidden_size: model hidden size. If ``None`` it is resolved from
+                ``self.vllm_config.model_config.get_hidden_size()`` (so the
+                API server doesn't have to thread it through every call).
+            k_dim: artifact vector dimensionality (default 12).
+            poc_stronger_rng: if True, use murmur-concat RNG path; default
+                False (legacy seeded normal path).
 
         Returns:
             ``{"artifacts": [{"nonce": int, "vector_b64": str}, ...],
-               "rank": int, "elapsed_ms": float}``
+               "rank": int}``
+
+            On PP non-last ranks the underlying forward returns ``None``
+            (intermediate tensors were forwarded inter-rank); we mirror that
+            with an empty artifact list so the caller can aggregate uniformly.
 
             Keep the payload msgpack-friendly. Do NOT return torch tensors.
-
-        Bindings to private attributes (resolved via compat shim):
-            self.model_runner.kv_caches[:N]   -- scratch space (PoC reuses
-                blocks starting at index 0, see poc_model_runner.py)
-            self.model_runner.model           -- nn.Module forward target
-            self.model_runner.attn_metadata_builders -- for CommonAttentionMetadata
         """
-        # NOTE(layer-1): port the body of vllm/poc/poc_model_runner.py
-        # ``run_forward`` here. The current implementation in
-        # ``gonka_poc.poc.poc_model_runner`` still references upstream
-        # private symbols; the compat shim in
-        # ``gonka_poc._compat.v0_23`` is where private-API touchpoints
-        # (CommonAttentionMetadata constructor, kv_caches layout) get
-        # normalised against the running vllm version.
-        #
-        # Pseudocode:
-        #     from gonka_poc.poc.poc_model_runner import run_poc_forward
-        #     from gonka_poc._compat import current as compat
-        #     attn_md = compat.build_common_attention_metadata(
-        #         model_runner=self.model_runner,
-        #         seq_len=payload["seq_len"],
-        #     )
-        #     artifacts = run_poc_forward(
-        #         model_runner=self.model_runner,
-        #         attn_metadata=attn_md,
-        #         payload=payload,
-        #         batch_size=batch_size,
-        #     )
-        #     return {"artifacts": artifacts, "rank": int(self.rank), ...}
-        raise NotImplementedError(
-            "execute_poc_forward: not yet wired to gonka_poc.poc.poc_model_runner. "
-            "Pending layer-1 port via gonka_poc._compat.v0_23 once the contract "
-            "test pins the CommonAttentionMetadata constructor for the installed "
-            "vllm version."
+        # Deferred imports: pulling gonka_poc.poc.* requires a configured
+        # vllm runtime (vllm.logger), which is only available inside the
+        # worker process.
+        from gonka_poc.poc.data import encode_vector
+        from gonka_poc.poc.poc_model_runner import (
+            DEFAULT_K_DIM,
+            execute_poc_forward as _execute_poc_forward,
         )
+
+        if not nonces:
+            return {"artifacts": [], "rank": int(getattr(self, "rank", -1))}
+
+        if hidden_size is None:
+            # vllm_config.model_config.get_hidden_size() is the v0.23
+            # canonical accessor; fall back to model_config directly if a
+            # future restructure splits the config tree.
+            try:
+                hidden_size = int(
+                    self.vllm_config.model_config.get_hidden_size()
+                )
+            except AttributeError:
+                hidden_size = int(self.model_config.get_hidden_size())
+
+        result = _execute_poc_forward(
+            self,  # the live Worker; matches the ``worker`` param in poc_model_runner
+            block_hash,
+            public_key,
+            list(nonces),
+            int(seq_len),
+            int(hidden_size),
+            k_dim=int(k_dim) if k_dim is not None else DEFAULT_K_DIM,
+            poc_stronger_rng=bool(poc_stronger_rng),
+        )
+
+        rank = int(getattr(self, "rank", -1))
+
+        # PP non-last ranks return None from the underlying forward.
+        if result is None:
+            return {"artifacts": [], "rank": rank}
+
+        vectors = result.get("vectors")
+        result_nonces = result.get("nonces", [])
+
+        artifacts: List[Dict[str, Any]] = []
+        if vectors is not None and len(result_nonces) > 0:
+            for i, nonce in enumerate(result_nonces):
+                artifacts.append({
+                    "nonce": int(nonce),
+                    "vector_b64": encode_vector(vectors[i]),
+                })
+
+        return {"artifacts": artifacts, "rank": rank}
 
     # ------------------------------------------------------------------ #
     # Diagnostic / liveness pings (cheap, no GPU)
@@ -149,7 +163,11 @@ class PoCWorkerExtension:
 
         Returns a small dict only; do NOT return the tensors themselves.
         """
-        kv_caches = getattr(self.model_runner, "kv_caches", None) if hasattr(self, "model_runner") else None
+        kv_caches = (
+            getattr(self.model_runner, "kv_caches", None)
+            if hasattr(self, "model_runner")
+            else None
+        )
         if kv_caches is None:
             return {"available": False}
         if not kv_caches:
