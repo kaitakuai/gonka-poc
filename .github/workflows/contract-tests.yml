@@ -1,0 +1,63 @@
+name: contract-tests
+
+# Contract tests are CPU-only: they import gonka_poc + vllm and assert that the
+# vllm surfaces we depend on (engine args, model runner, sampler hooks, etc.)
+# still exist with the expected shape. No GPU work is invoked.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contract-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    name: contract (py3.11, vllm ${{ matrix.vllm }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        vllm:
+          - "0.23.0"
+          - "0.23.1rc0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "pyproject.toml"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install vllm==${{ matrix.vllm }}
+        # Pin vllm explicitly so the matrix entry — not the >=0.23,<0.24 range
+        # in pyproject — picks the version under test. --pre lets pip accept
+        # the rc tag for the 0.23.1rc0 entry.
+        run: python -m pip install --pre "vllm==${{ matrix.vllm }}"
+
+      - name: Install gonka-poc with test extras
+        run: python -m pip install -e ".[test]"
+
+      - name: Run contract tests
+        run: pytest tests/contract -v --tb=short
