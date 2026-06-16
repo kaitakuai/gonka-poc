@@ -12,10 +12,13 @@ GPU work starts. The middleware is purely a "don't accept new work" gate.
 """
 from __future__ import annotations
 
-from typing import Awaitable, Callable, Iterable, Optional
+import logging
+from typing import Iterable, Optional
 
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+logger = logging.getLogger("gonka_poc.entrypoint.gating")
 
 
 # Paths that PoC priority blocks. Keep this list narrow -- /gonka/poc/* and
@@ -61,6 +64,15 @@ class PoCGatingMiddleware:
     Starlette wraps middlewares in REVERSE insertion order, so installing this
     AFTER ``vllm.entrypoints.openai.api_server.build_app(...)`` returns puts it
     OUTERMOST -- it runs before any vLLM handler.
+
+    Doubles as the carrier for the one-shot "plugin loaded but no gate
+    attached" warning. We used to register that via ``@app.on_event("startup")``
+    but vLLM's ``build_app`` constructs ``FastAPI(lifespan=lifespan)`` (see
+    v0.23.0 ``api_server.py``), and Starlette silently ignores ``on_event``
+    handlers when a ``lifespan`` is supplied (FastAPI has deprecated this
+    pattern since 0.93). To keep the warning fail-loud across both
+    ``vllm serve`` and ``gonka-vllm-serve``, we now perform the check on the
+    first HTTP dispatch through this middleware.
     """
 
     def __init__(
@@ -73,12 +85,22 @@ class PoCGatingMiddleware:
         self.app = app
         self.gate = gate
         self.blocked_prefixes = tuple(blocked_prefixes)
+        self._gate_check_done: bool = False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http":
             # websockets / lifespan: pass through unchanged
             await self.app(scope, receive, send)
             return
+
+        # One-shot gate-presence check. Fires on first HTTP request because the
+        # FastAPI ``on_event("startup")`` hook is silently dropped under
+        # ``FastAPI(lifespan=...)`` (which is what upstream ``build_app`` uses).
+        # This is the only place we can both (a) see ``app.state`` and (b) be
+        # guaranteed to run regardless of which lifespan path was wired up.
+        if not self._gate_check_done:
+            self._gate_check_done = True
+            self._maybe_warn_missing_gate(scope)
 
         if self.gate.is_active():
             path: str = scope.get("path", "")
@@ -96,6 +118,35 @@ class PoCGatingMiddleware:
                 return
 
         await self.app(scope, receive, send)
+
+    def _maybe_warn_missing_gate(self, scope: Scope) -> None:
+        """Log a warning if the plugin loaded but no gate is attached.
+
+        Reads ``app.state.gonka_gate`` via the ASGI scope. The middleware sits
+        OUTERMOST so ``scope["app"]`` is the FastAPI instance built by
+        ``vllm.entrypoints.openai.api_server.build_app``. In the
+        ``gonka-vllm-serve`` happy path this is a no-op because the gate IS
+        present; in the bare ``vllm serve`` accident it fires loudly.
+        """
+        try:
+            import gonka_poc
+
+            plugin_loaded = bool(getattr(gonka_poc, "PLUGIN_LOADED", False))
+            if not plugin_loaded:
+                return
+
+            app = scope.get("app")
+            state = getattr(app, "state", None)
+            gate_present = getattr(state, "gonka_gate", None) is not None
+            if not gate_present:
+                logger.warning(
+                    "gonka_poc plugin loaded but app.state.gonka_gate is missing -- "
+                    "PoC chat-completion gating is DISABLED. "
+                    "Did you launch with `vllm serve` instead of `gonka-vllm-serve`?"
+                )
+        except Exception:  # pragma: no cover - defensive
+            # Never let the diagnostic crash a real request.
+            logger.exception("gonka_poc: gate-presence warning check raised")
 
 
 __all__ = ["PoCGate", "PoCGatingMiddleware", "DEFAULT_BLOCKED_PREFIXES"]

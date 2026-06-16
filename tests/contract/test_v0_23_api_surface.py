@@ -164,6 +164,29 @@ def test_cli_args_helpers() -> None:
         )
 
 
+def test_cli_env_setup_import_path() -> None:
+    """``cli_env_setup`` MUST be importable from
+    ``vllm.entrypoints.serve.utils.api_utils`` on v0.23.
+
+    Background: upstream ``api_server.py:__main__`` (v0.23.0 L697) calls
+    ``cli_env_setup()`` before ``uvloop.run`` to set
+    ``VLLM_WORKER_MULTIPROC_METHOD=spawn``. Skipping it crashes TP>1 / PP>1
+    launches with the classic CUDA-in-forked-process error.
+    ``gonka_poc.entrypoint.api_router.main`` mirrors that call; if the
+    import path moves in a future vLLM release, the soft fallback in main()
+    kicks in (warning + unsafe default), and this contract test fires loudly
+    so we can update the import.
+    """
+    pytest.importorskip("vllm")
+    mod = importlib.import_module("vllm.entrypoints.serve.utils.api_utils")
+    fn = getattr(mod, "cli_env_setup", None)
+    assert fn is not None and callable(fn), (
+        "vllm.entrypoints.serve.utils.api_utils.cli_env_setup missing -- "
+        "gonka_poc.entrypoint.api_router.main needs revision (currently "
+        "soft-falls-back to a warning, leaving multiproc method unsafe)."
+    )
+
+
 # ---------------------------------------------------------------------------- #
 # ModelRegistry surface
 # ---------------------------------------------------------------------------- #

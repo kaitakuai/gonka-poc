@@ -127,11 +127,25 @@ def _install_build_app_warning_wrapper() -> None:
     def _wrapped_build_app(*args, **kwargs):  # type: ignore[no-untyped-def]
         app = original_build_app(*args, **kwargs)
         try:
-            from gonka_poc.entrypoint.api_router import (
-                register_gate_presence_warning,
-            )
+            # The historical implementation relied on
+            # ``@app.on_event("startup")``, but upstream ``build_app`` calls
+            # ``FastAPI(lifespan=lifespan)`` -- Starlette silently drops
+            # on_event handlers in that mode (FastAPI deprecated since 0.93).
+            # Install a tiny ASGI middleware that fires the warning on first
+            # HTTP dispatch instead. ``gonka-vllm-serve`` installs
+            # ``PoCGatingMiddleware`` (which carries the same check), so
+            # this wrapper covers ONLY the bare ``vllm serve`` accident path.
+            from gonka_poc.entrypoint.gating import PoCGatingMiddleware, PoCGate
 
-            register_gate_presence_warning(app)
+            # Sentinel gate that never activates -- the middleware acts purely
+            # as the warning carrier here. ``PoCGate().is_active()`` is False
+            # by construction so no real request is ever 503'd by this shim.
+            sentinel_gate = PoCGate()
+            app.add_middleware(
+                PoCGatingMiddleware,
+                gate=sentinel_gate,
+                blocked_prefixes=(),
+            )
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "gonka_poc: failed to attach gate-presence warning to FastAPI app"
