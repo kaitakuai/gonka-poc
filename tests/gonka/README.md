@@ -10,8 +10,17 @@ Tests for Gonka-specific features in the vLLM fork: Proof of Computation (PoC), 
 
 | File | What it tests |
 |------|---------------|
-| `test_chat_priority_gating.py` | Chat priority gating logic with mocked AsyncLLM and FastAPI components |
 | `test_grammar_graceful_degradation.py` | Grammar FSM graceful degradation with mocked xgrammar backend |
+
+> **TODO** — `test_chat_priority_gating.py` was deleted in the
+> arch-refactor that replaced the `AsyncLLM.poc_request` monkey-patch
+> with the `collective_rpc`+`PoCGate` design (see ADR-0013, ADR-0014).
+> A pure-unit replacement should exercise
+> `gonka_poc.entrypoint.gating.PoCGatingMiddleware` directly via a
+> Starlette test client: activate the gate → assert `/v1/chat/completions`
+> returns `503` with `Retry-After`; deactivate → assert it returns `200`.
+> Write alongside the GPU smoke validation when hardware-test infra
+> lands.
 
 ### Live Tests (require running vLLM server)
 
