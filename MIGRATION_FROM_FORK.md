@@ -72,6 +72,70 @@ Keep them as a **thin patch series** on a `kaitakuai/vllm` fork branch
 (`kaitakuai/vllm @ poc-sampler-residual-v0.23`) and rebuild the wheel for
 each vllm minor bump. Move to plugin only after an upstream PR adds a hook.
 
+### Fork branch and wheel
+
+* **Fork repository**: `kaitakuai/vllm` (owned by the kaitakuai org;
+  hard-fork of `vllm-project/vllm` -- this is **not** an upstream
+  `gonka-ai/gonka` branch and **not** a `vllm-project/vllm` branch).
+* **Branch**: `poc-sampler-residual-v0.23`
+* **Wheel version (PEP 440)**: `0.23.0+gonka.sampler1`
+  * Local-version segment `+gonka.sampler1` advertises that the wheel is a
+    kaitakuai-org residual rebuild of stock `vllm==0.23.0`; PyPI rejects
+    local versions, so the wheel is published only to the
+    `kaitakuai-index` private index.
+  * Bump the trailing integer (`sampler2`, `sampler3`, ...) for each
+    rebuild on the same upstream `0.23.x` base; bump the leading version
+    (`0.24.0+gonka.sampler1`) when rebasing to a new vLLM minor.
+
+### Rationale (one paragraph)
+
+The five sampler-stack commits plus the structured-output graceful-degradation
+patch stay in the `kaitakuai/vllm` fork because they edit `vllm/v1/sample/*`,
+`vllm/sampling_params.py`, `vllm/v1/worker/gpu_input_batch.py`,
+`vllm/v1/worker/gpu_model_runner.py`, and `vllm/v1/structured_output/*` --
+all private surfaces with no plugin extension point in `vllm==0.23.*`. Per
+ADR-0013 "Options considered", the sampler stack (enforced tokens +
+per-request `logprobs_mode`) is the hardest surface to plugin-ize: it
+requires a new public `LogitsProcessor`-style hook on `SamplingParams` plus
+a documented `per_request_extras` slot on `InputBatch`, and that work
+"leaves the fork last" in the Layer 3 sequencing. Until upstream merges
+those hooks (see the Upstream-PR backlog below), this residual must travel
+as a wheel, not as a runtime monkey-patch.
+
+### The six fork-resident commits
+
+These are the commits that live on `kaitakuai/vllm @
+poc-sampler-residual-v0.23` and are baked into the
+`vllm==0.23.0+gonka.sampler1` wheel.
+
+| # | SHA | Subject |
+|---|-----|---------|
+| 1 | `1e6913a38` | feat(sampling): add per-request logprobs_mode and enforced_token_ids fields |
+| 2 | `e35461e0e` | feat(sampler): add need_processed_logprobs and .sample() wrapper |
+| 3 | `81abd50f5` | feat(sampler): port PoC v2 mixed-mode sampling and enforced tokens |
+| 4 | `95dce5242` | feat(worker): port InputBatch enforced-tokens and logprobs-mode bookkeeping |
+| 5 | `1a328700e` | fix(sampler): thread need_processed_logprobs through forward_xpu |
+| 6 | structured-output | feat(structured-output): graceful degradation on grammar token rejection (SHA pending pick from source branch; lands on the same fork branch alongside the sampler series) |
+
+### Install order for operators
+
+The plugin assumes the residual wheel is already on the import path. Install
+the wheel **before** `gonka-poc` so that pip resolves `vllm==0.23.0+gonka.sampler1`
+from the kaitakuai index instead of pulling stock `0.23.0` from PyPI:
+
+```bash
+pip install vllm==0.23.0+gonka.sampler1 \
+  --index-url <kaitakuai-index> \
+  --extra-index-url https://pypi.org/simple \
+  && pip install gonka-poc
+```
+
+`--index-url <kaitakuai-index>` is primary (the residual wheel lives there);
+`--extra-index-url https://pypi.org/simple` lets pip resolve the rest of the
+dependency tree (PyTorch, FlashInfer, etc.) from PyPI. Replace
+`<kaitakuai-index>` with the real index URL provisioned for your operator
+(see the foundry profile / mlnode-foundry secrets).
+
 | SHA | Subject | Touched files | Rationale |
 |-----|---------|---------------|-----------|
 | `1e6913a38` | feat(sampling): add per-request logprobs_mode and enforced_token_ids fields | `vllm/sampling_params.py`, `vllm/v1/sample/metadata.py` | Sampler-stack data fields -- no plugin hook. ADR fork-residual. |

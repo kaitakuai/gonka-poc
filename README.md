@@ -20,11 +20,16 @@ sampler-stack hook. See `MIGRATION_FROM_FORK.md`.
 
 ## Quick start
 
+The plugin requires the kaitakuai-org **sampler-residual wheel** of vLLM
+(`vllm==0.23.0+gonka.sampler1`) on the import path -- stock `vllm/vllm-openai:v0.23.0-cu129`
+does **not** carry the enforced-token / `logprobs_mode` sampler edits the
+plugin relies on. Use either the prebuilt overlay image:
+
 ```bash
 docker run --rm -it --gpus all \
   -p 8000:8000 \
   -e VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
-  vllm/vllm-openai:v0.23.0-cu129 \
+  ghcr.io/kaitakuai/vllm-sampler-residual:0.23.0+gonka.sampler1 \
   sh -c "pip install gonka-poc && \
          gonka-vllm-serve \
            --model Qwen/Qwen3-235B-A22B-FP8 \
@@ -35,11 +40,50 @@ docker run --rm -it --gpus all \
            --dtype auto"
 ```
 
+...or install the residual wheel into the stock image at runtime via the
+kaitakuai-org private index (replace `<kaitakuai-index>` with the index URL
+provisioned for your operator):
+
+```bash
+docker run --rm -it --gpus all \
+  -p 8000:8000 \
+  -e VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
+  --build-arg KAITAKUAI_INDEX=<kaitakuai-index> \
+  vllm/vllm-openai:v0.23.0-cu129 \
+  sh -c "pip install vllm==0.23.0+gonka.sampler1 \
+           --index-url <kaitakuai-index> \
+           --extra-index-url https://pypi.org/simple && \
+         pip install gonka-poc && \
+         gonka-vllm-serve \
+           --model Qwen/Qwen3-235B-A22B-FP8 \
+           --worker-extension-cls gonka_poc.worker.PoCWorkerExtension \
+           --tensor-parallel-size 4 \
+           --enforce-eager \
+           --max-model-len 100000 \
+           --dtype auto"
+```
+
+The overlay image name above (`ghcr.io/kaitakuai/vllm-sampler-residual`) is
+a placeholder; the canonical build lives in `mlnode-foundry` under
+`profiles/gonka-poc/Dockerfile.overlay` (see `MIGRATION_FROM_FORK.md`
+Section 2).
+
 `gonka-vllm-serve` is a thin composition wrapper around
 `vllm.entrypoints.openai.api_server`: it accepts every flag stock
 `vllm serve` accepts (it re-uses `make_arg_parser` / `validate_parsed_serve_args`).
 The PoC router and gating middleware are inserted between `build_app(...)`
 and `serve_http(...)` -- no vLLM source is patched.
+
+## Why the sampler-residual fork?
+
+`gonka-poc` itself is a stock-wheels plugin, but it depends on a small set
+of enforced-token / `logprobs_mode` edits in `vllm/v1/sample/*` that have no
+extension point in `vllm==0.23.*`. Those edits live on a thin patch series
+maintained by **kaitakuai** (not upstream `gonka-ai/gonka`, and not
+`vllm-project/vllm`) at `kaitakuai/vllm @ poc-sampler-residual-v0.23`, and
+ship as the wheel `vllm==0.23.0+gonka.sampler1`. For the per-commit
+disposition, install order, and the upstream-PR backlog that retires this
+fork, see `MIGRATION_FROM_FORK.md` Section 3 and ADR-0013.
 
 ## Layout
 
