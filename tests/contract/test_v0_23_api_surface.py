@@ -164,6 +164,29 @@ def test_cli_args_helpers() -> None:
         )
 
 
+def test_cli_env_setup_import_path() -> None:
+    """``cli_env_setup`` MUST be importable from
+    ``vllm.entrypoints.serve.utils.api_utils`` on v0.23.
+
+    Background: upstream ``api_server.py:__main__`` (v0.23.0 L697) calls
+    ``cli_env_setup()`` before ``uvloop.run`` to set
+    ``VLLM_WORKER_MULTIPROC_METHOD=spawn``. Skipping it crashes TP>1 / PP>1
+    launches with the classic CUDA-in-forked-process error.
+    ``gonka_poc.entrypoint.api_router.main`` mirrors that call; if the
+    import path moves in a future vLLM release, the soft fallback in main()
+    kicks in (warning + unsafe default), and this contract test fires loudly
+    so we can update the import.
+    """
+    pytest.importorskip("vllm")
+    mod = importlib.import_module("vllm.entrypoints.serve.utils.api_utils")
+    fn = getattr(mod, "cli_env_setup", None)
+    assert fn is not None and callable(fn), (
+        "vllm.entrypoints.serve.utils.api_utils.cli_env_setup missing -- "
+        "gonka_poc.entrypoint.api_router.main needs revision (currently "
+        "soft-falls-back to a warning, leaving multiproc method unsafe)."
+    )
+
+
 # ---------------------------------------------------------------------------- #
 # ModelRegistry surface
 # ---------------------------------------------------------------------------- #
@@ -441,3 +464,58 @@ def test_openai_serving_chat_export() -> None:
         "OpenAIServingChat.create_chat_completion missing -- "
         "gonka_poc gating middleware needs revision."
     )
+
+
+# ---------------------------------------------------------------------------- #
+# _compat dispatcher contract (regression for the lru_cache function-binding bug)
+# ---------------------------------------------------------------------------- #
+
+def test_compat_current_returns_module() -> None:
+    """``from gonka_poc._compat import current`` MUST be a callable resolver
+    that returns the dispatched compat module.
+
+    Regression: a previous revision exposed ``current`` as the
+    ``lru_cache``-wrapped function itself. ``from gonka_poc._compat import
+    current as compat`` then bound the function, so every subsequent
+    ``compat.build_common_attention_metadata(...)`` raised ``AttributeError``
+    (functions do not carry arbitrary attributes) and the first PoC forward
+    crashed in production. The contract pinned here:
+
+        from gonka_poc._compat import current
+        mod = current()          # callable, returns a module
+        mod.build_common_attention_metadata(...)  # symbols live on the module
+
+    is the only shape that survives both ``from ... import current`` (which
+    bypasses PEP 562 ``__getattr__``) and attribute-style ``_compat.current``.
+    """
+    pytest.importorskip("vllm")
+    from gonka_poc._compat import current
+
+    assert callable(current), (
+        "gonka_poc._compat.current must be callable -- "
+        "the lru_cache function-binding regression has returned. "
+        "Consumers do ``from gonka_poc._compat import current`` and then "
+        "``compat = current(); compat.<symbol>(...)``."
+    )
+
+    import types
+
+    mod = current()
+    assert isinstance(mod, types.ModuleType), (
+        f"current() must return a module, got {type(mod)!r}. "
+        "Check gonka_poc._compat.__init__._current_impl resolver."
+    )
+
+    for symbol in (
+        "build_common_attention_metadata",
+        "build_attn_metadata_per_layer",
+        "get_kv_cache_pool",
+        "abort_all_requests",
+    ):
+        attr = getattr(mod, symbol, None)
+        assert callable(attr), (
+            f"compat module missing callable {symbol!r}; "
+            f"present attrs = {sorted(a for a in dir(mod) if not a.startswith('_'))!r}. "
+            f"Either gonka_poc._compat.v0_23 dropped the export or _DISPATCH "
+            f"is pointing at the wrong module."
+        )

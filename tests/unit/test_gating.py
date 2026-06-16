@@ -232,3 +232,129 @@ def test_503_body_is_json_with_retry_after(
     assert retry_after.isdigit(), (
         f"Retry-After must be numeric delta-seconds, got {retry_after!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Gate-presence warning (lifespan-safe)
+#
+# Background: upstream ``vllm.entrypoints.openai.api_server.build_app``
+# constructs ``FastAPI(lifespan=lifespan)``. Starlette silently drops
+# ``@app.on_event("startup")`` handlers in that mode. The warning that fires
+# when the plugin is loaded without a gate attached now lives in
+# ``PoCGatingMiddleware`` and runs on first HTTP dispatch instead.
+# --------------------------------------------------------------------------- #
+
+
+def test_gate_presence_warning_fires_when_state_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If PLUGIN_LOADED is True and app.state.gonka_gate is missing, the
+    middleware logs a warning on the first HTTP request.
+    """
+    import gonka_poc
+
+    app = FastAPI()
+    # Intentionally do NOT set app.state.gonka_gate -- this is the
+    # bare ``vllm serve`` accident path.
+    sentinel_gate = PoCGate()  # value irrelevant; check reads app.state
+    app.add_middleware(
+        PoCGatingMiddleware,
+        gate=sentinel_gate,
+        blocked_prefixes=(),
+    )
+
+    @app.get("/_healthz")
+    async def healthz() -> dict:
+        return {"ok": True}
+
+    original = getattr(gonka_poc, "PLUGIN_LOADED", False)
+    gonka_poc.PLUGIN_LOADED = True
+    try:
+        with caplog.at_level("WARNING", logger="gonka_poc.entrypoint.gating"):
+            with TestClient(app) as client:
+                r1 = client.get("/_healthz")
+                r2 = client.get("/_healthz")
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+
+        warnings = [
+            rec for rec in caplog.records
+            if "gonka_poc plugin loaded but app.state.gonka_gate is missing" in rec.message
+        ]
+        assert len(warnings) == 1, (
+            f"Expected exactly one gate-presence warning across two requests; "
+            f"got {len(warnings)}. Records: {[r.message for r in caplog.records]}"
+        )
+    finally:
+        gonka_poc.PLUGIN_LOADED = original
+
+
+def test_gate_presence_warning_silent_when_gate_attached(
+    app_and_gate: tuple[FastAPI, PoCGate],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Happy path: ``app.state.gonka_gate`` IS set, so the middleware MUST
+    NOT log the warning -- this is the ``gonka-vllm-serve`` configuration.
+    """
+    import gonka_poc
+
+    app, _gate = app_and_gate
+    original = getattr(gonka_poc, "PLUGIN_LOADED", False)
+    gonka_poc.PLUGIN_LOADED = True
+    try:
+        with caplog.at_level("WARNING", logger="gonka_poc.entrypoint.gating"):
+            with TestClient(app) as client:
+                r = client.post("/v1/chat/completions")
+        assert r.status_code == 200
+
+        warnings = [
+            rec for rec in caplog.records
+            if "gonka_poc plugin loaded but app.state.gonka_gate is missing" in rec.message
+        ]
+        assert warnings == [], (
+            f"Gate IS present; warning must not fire. Got: "
+            f"{[r.message for r in warnings]}"
+        )
+    finally:
+        gonka_poc.PLUGIN_LOADED = original
+
+
+def test_gate_presence_warning_silent_when_plugin_not_loaded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If the plugin entry point never ran (PLUGIN_LOADED is False), there's
+    nothing to warn about even when no gate is attached -- the user simply
+    isn't using gonka_poc in this process.
+    """
+    import gonka_poc
+
+    app = FastAPI()
+    sentinel_gate = PoCGate()
+    app.add_middleware(
+        PoCGatingMiddleware,
+        gate=sentinel_gate,
+        blocked_prefixes=(),
+    )
+
+    @app.get("/_healthz")
+    async def healthz() -> dict:
+        return {"ok": True}
+
+    original = getattr(gonka_poc, "PLUGIN_LOADED", False)
+    gonka_poc.PLUGIN_LOADED = False
+    try:
+        with caplog.at_level("WARNING", logger="gonka_poc.entrypoint.gating"):
+            with TestClient(app) as client:
+                r = client.get("/_healthz")
+        assert r.status_code == 200
+
+        warnings = [
+            rec for rec in caplog.records
+            if "gonka_poc plugin loaded but app.state.gonka_gate is missing" in rec.message
+        ]
+        assert warnings == [], (
+            f"PLUGIN_LOADED was False; warning must not fire. Got: "
+            f"{[r.message for r in warnings]}"
+        )
+    finally:
+        gonka_poc.PLUGIN_LOADED = original

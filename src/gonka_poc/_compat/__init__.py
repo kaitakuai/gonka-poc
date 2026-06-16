@@ -5,20 +5,24 @@ Within that range some private structures (CommonAttentionMetadata,
 kv_caches layout, internal model_runner attributes) may shift; we localise
 every such touchpoint inside one of the ``vN_M.py`` modules in this package.
 
-Selection happens LAZILY -- the first call to :func:`current` (or the first
-attribute lookup on the package via PEP 562 ``__getattr__``) imports the
+Selection happens LAZILY -- the first call to :func:`current` imports the
 matching submodule. This keeps test / lint discovery from forcing a real
 ``import vllm`` at module load time.
 
-Usage::
+Usage (the ONLY supported form -- see history below for why)::
 
-    from gonka_poc._compat import current as compat
-    md = compat().build_common_attention_metadata(...)
+    from gonka_poc._compat import current
+    compat = current()
+    md = compat.build_common_attention_metadata(...)
 
-Or via PEP 562 attribute access::
-
-    from gonka_poc import _compat
-    md = _compat.current.build_common_attention_metadata(...)
+History: an earlier revision exposed ``current`` as an ``lru_cache``-wrapped
+function and tried to dual-publish it via PEP 562 ``__getattr__`` so
+``_compat.current.<symbol>`` would also work. The PEP 562 path silently lost
+to real-attribute lookup for ``from gonka_poc._compat import current``
+(Python binds the function object directly, bypassing ``__getattr__``), so
+the first ``compat.build_common_attention_metadata(...)`` call raised
+``AttributeError`` and crashed the PoC forward. The contract is now:
+``current`` is a plain function, call it to get the module.
 
 Add a new ``vN_M.py`` AND register it in :data:`_DISPATCH` when porting to a
 new vLLM minor; keep contract tests (``tests/contract/test_v*_api_surface.py``)
@@ -63,8 +67,8 @@ _DISPATCH: Mapping[Tuple[int, int], str] = {
 
 
 @lru_cache(maxsize=1)
-def current() -> ModuleType:
-    """Return the compat submodule matching the installed vllm minor.
+def _current_impl() -> ModuleType:
+    """Resolve and import the compat submodule for the installed vllm minor.
 
     Cached so repeat callers don't re-import. Raises ``RuntimeError`` with the
     list of supported versions when the installed vllm minor is not in
@@ -86,15 +90,16 @@ def current() -> ModuleType:
     return importlib.import_module(mod_name)
 
 
-def __getattr__(name: str) -> object:
-    """PEP 562 hook so ``gonka_poc._compat.current`` (attribute style) and
-    ``gonka_poc._compat.<symbol>`` both resolve through :func:`current`
-    without triggering ``import vllm`` at module load time.
+def current() -> ModuleType:
+    """Return the compat submodule matching the installed vllm minor.
+
+    Consumers MUST call this -- ``from gonka_poc._compat import current as compat``
+    used to bind the lru_cache-wrapped function object directly, which made
+    subsequent ``compat.build_common_attention_metadata(...)`` lookups raise
+    ``AttributeError`` because functions do not carry arbitrary attributes.
+    The contract is now: ``compat = current(); compat.<symbol>(...)``.
     """
-    if name == "current":
-        return current()
-    # Fall through for any other attribute the user may add to a submodule.
-    raise AttributeError(f"module 'gonka_poc._compat' has no attribute {name!r}")
+    return _current_impl()
 
 
 __all__ = ["current"]

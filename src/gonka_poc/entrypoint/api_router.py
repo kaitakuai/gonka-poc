@@ -65,32 +65,32 @@ def attach_poc_router(app: FastAPI) -> None:
 
 
 def register_gate_presence_warning(app: FastAPI) -> None:
-    """Attach a FastAPI startup hook that warns when the plugin is loaded
-    without the gating middleware installed.
+    """Compatibility shim -- the gate-presence warning is now driven by
+    :class:`PoCGatingMiddleware` on first HTTP dispatch.
 
-    This catches the operator footgun where ``vllm serve`` runs instead of
-    ``gonka-vllm-serve``: the plugin entry point still executes (so models /
-    custom_ops get registered) but no ``app.state.gonka_gate`` is set and the
-    chat endpoint will NOT be 503-gated while PoC seizes the GPU.
+    Background: this function used to attach a ``@app.on_event("startup")``
+    handler. vLLM 0.23.0 ``build_app`` constructs
+    ``FastAPI(lifespan=lifespan)`` (see ``api_server.py``). Starlette
+    silently ignores ``on_event`` handlers when a ``lifespan`` is supplied
+    -- FastAPI deprecated this pattern in 0.93 -- so the warning never
+    fired in production.
 
-    Invoked both from :func:`build_gonka_app` (where the warning never fires
-    -- the gate is always present by construction) AND from a build_app
-    wrapper installed by :func:`gonka_poc.plugin.register` (where the warning
-    will fire because plain ``vllm serve`` never attached a gate).
+    Rather than thread a brittle "wrap the lifespan" contextmanager through
+    both the bare-``vllm serve`` plugin path and our own entrypoint, we
+    moved the check into :class:`PoCGatingMiddleware` (one-shot on first
+    request). This shim is kept so external callers (notably
+    :func:`gonka_poc.plugin._install_build_app_warning_wrapper`) continue
+    to compile; it is intentionally a no-op.
+
+    Note: in the bare-``vllm serve`` case there is no gating middleware
+    installed either, so the warning path now travels through whatever
+    middleware vLLM itself wires up. The plugin's build_app wrapper has
+    been updated to install a minimal warning-only middleware in that
+    scenario -- see :func:`gonka_poc.plugin._install_build_app_warning_wrapper`.
     """
-
-    @app.on_event("startup")
-    async def _gonka_gate_presence_warning() -> None:  # pragma: no cover - startup hook
-        import gonka_poc
-
-        plugin_loaded = bool(getattr(gonka_poc, "PLUGIN_LOADED", False))
-        gate_present = getattr(app.state, "gonka_gate", None) is not None
-        if plugin_loaded and not gate_present:
-            logger.warning(
-                "gonka_poc plugin loaded but app.state.gonka_gate is missing -- "
-                "PoC chat-completion gating is DISABLED. "
-                "Did you launch with `vllm serve` instead of `gonka-vllm-serve`?"
-            )
+    # Intentionally empty. See docstring above for the rationale and the
+    # replacement path (PoCGatingMiddleware._maybe_warn_missing_gate).
+    del app  # unused
 
 
 def build_gonka_app(
@@ -154,6 +154,18 @@ async def _run_server(args: Any) -> None:
     )
     from vllm.entrypoints.launcher import serve_http
 
+    # Best-effort: upstream pulls this from
+    # ``vllm.entrypoints.serve.utils.server_utils`` to honour
+    # ``--log-config-file`` / ``--disable-access-log-for-endpoints``. If the
+    # internal module path moves in a future vLLM release, fall back to None
+    # (uvicorn defaults) rather than crashing serve.
+    try:
+        from vllm.entrypoints.serve.utils.server_utils import (  # type: ignore[import-not-found]
+            get_uvicorn_log_config,
+        )
+    except Exception:  # pragma: no cover - vllm internal layout drift
+        get_uvicorn_log_config = None  # type: ignore[assignment]
+
     listen_address, sock = setup_server(args)
 
     async with build_async_engine_client(args) as engine_client:
@@ -177,19 +189,43 @@ async def _run_server(args: Any) -> None:
         # serve_http triggers).
         await init_app_state(engine_client, app.state, args, supported_tasks)
 
+        # Mirror upstream ``build_and_serve`` (v0.23.0 api_server.py:586-602).
+        # Every kwarg upstream forwards MUST be forwarded here too -- missing
+        # any of these silently drops user-supplied TLS / HTTP-limit / log
+        # config flags. ``getattr(args, "...", None)`` keeps us robust to
+        # upstream argparse changes: a removed flag falls back to None, which
+        # ``serve_http`` already tolerates.
+        log_config = None
+        if get_uvicorn_log_config is not None:
+            try:
+                log_config = get_uvicorn_log_config(args)
+            except Exception:  # pragma: no cover - defensive
+                log_config = None
+
+        serve_http_kwargs: dict[str, Any] = {
+            "sock": sock,
+            "enable_ssl_refresh": getattr(args, "enable_ssl_refresh", False),
+            "host": args.host,
+            "port": args.port,
+            "log_level": getattr(args, "uvicorn_log_level", "info"),
+            # disable_uvicorn_access_log == True  =>  access_log = False.
+            "access_log": not getattr(args, "disable_uvicorn_access_log", False),
+            "timeout_keep_alive": envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+            "ssl_keyfile": getattr(args, "ssl_keyfile", None),
+            "ssl_certfile": getattr(args, "ssl_certfile", None),
+            "ssl_ca_certs": getattr(args, "ssl_ca_certs", None),
+            "ssl_cert_reqs": getattr(args, "ssl_cert_reqs", 0),
+            "ssl_ciphers": getattr(args, "ssl_ciphers", None),
+            "h11_max_incomplete_event_size": getattr(
+                args, "h11_max_incomplete_event_size", None
+            ),
+            "h11_max_header_count": getattr(args, "h11_max_header_count", None),
+        }
+        if log_config is not None:
+            serve_http_kwargs["log_config"] = log_config
+
         # Hand off to uvicorn via the stock launcher.
-        shutdown_task = await serve_http(
-            app,
-            sock=sock,
-            host=args.host,
-            port=args.port,
-            log_level=getattr(args, "uvicorn_log_level", "info"),
-            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
-            ssl_keyfile=getattr(args, "ssl_keyfile", None),
-            ssl_certfile=getattr(args, "ssl_certfile", None),
-            ssl_ca_certs=getattr(args, "ssl_ca_certs", None),
-            ssl_cert_reqs=getattr(args, "ssl_cert_reqs", 0),
-        )
+        shutdown_task = await serve_http(app, **serve_http_kwargs)
         await shutdown_task
 
     sock.close()
@@ -208,18 +244,50 @@ def main(argv: list[str] | None = None) -> int:
     )
     from vllm.utils import FlexibleArgumentParser
 
+    # ``cli_env_setup`` MUST run before we hand off to uvloop. Upstream calls
+    # it at the very top of ``vllm/entrypoints/openai/api_server.py:__main__``
+    # (v0.23.0 L697) to set ``VLLM_WORKER_MULTIPROC_METHOD=spawn`` (default is
+    # ``fork``). Skipping it crashes TP>1 / PP>1 launches with the classic
+    # CUDA-in-forked-process error -- our gonka-vllm-serve entry was missing
+    # this call entirely. Import path on v0.23.0:
+    # ``vllm.entrypoints.serve.utils.api_utils.cli_env_setup``.
+    try:
+        from vllm.entrypoints.serve.utils.api_utils import (  # type: ignore[import-not-found]
+            cli_env_setup,
+        )
+    except Exception:  # pragma: no cover - upstream layout drift fallback
+        cli_env_setup = None  # type: ignore[assignment]
+
+    if cli_env_setup is not None:
+        cli_env_setup()
+    else:
+        logger.warning(
+            "gonka-vllm-serve: could not import vllm.entrypoints.serve.utils."
+            "api_utils.cli_env_setup -- VLLM_WORKER_MULTIPROC_METHOD may be "
+            "left at the unsafe default. TP>1/PP>1 launches may crash on CUDA-fork."
+        )
+
     parser = FlexibleArgumentParser(
         description="gonka-vllm-serve: vLLM OpenAI server with Gonka PoC v2 plugin",
     )
     parser = make_arg_parser(parser)
 
     # Gonka-local toggles (do NOT shadow upstream flag names).
+    #
+    # nargs="+" (not "*"): the bare flag without values used to silently parse
+    # as an empty list, and ``build_gonka_app`` happily installed a tuple()
+    # of blocked prefixes -- the gate became permanently disabled because
+    # ``any(path.startswith(p) for p in ())`` is always False. ``nargs="+"``
+    # turns a typo (``--gonka-poc-block-prefixes`` with no values) into an
+    # argparse error instead of a silent gate-off.
     parser.add_argument(
         "--gonka-poc-block-prefixes",
-        nargs="*",
+        nargs="+",
         default=None,
-        help="Override which path prefixes PoC priority gates with 503. "
-        "Default: /v1/chat/completions /v1/completions",
+        help="REPLACES the default list of path prefixes that PoC priority "
+        "gates with 503 while generation is active. Requires at least one "
+        "value if supplied. Default (when omitted): "
+        "/v1/chat/completions /v1/completions.",
     )
 
     args = parser.parse_args(argv)

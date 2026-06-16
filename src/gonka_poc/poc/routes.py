@@ -10,6 +10,7 @@ from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 from vllm.logger import init_logger
+from gonka_poc._compat import current as _current
 from .config import PoCState
 from .data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
 from .callbacks import CallbackSender
@@ -460,6 +461,18 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     # immediately. The gate is the single source of truth for "PoC is
     # currently running" -- no module-level flag.
     gate.activate("init-generate")
+
+    # Abort any already-admitted chat/completions requests that snuck in
+    # before the gate flipped. PoCGatingMiddleware blocks NEW admissions;
+    # abort_all_requests() drains the in-flight set so PoC forwards run on
+    # an exclusively-owned GPU. Ordering contract (ADR-0013): gate.activate
+    # -> abort_all_requests -> spawn gen task. This depends on the compat
+    # dispatch shim (fix #1) for the `current()` module lookup.
+    compat = _current()
+    aborted = await compat.abort_all_requests(engine_client)
+    logger.info(
+        "PoC init: aborted %d in-flight requests before generation", aborted
+    )
 
     gen_task = asyncio.create_task(
         _generation_loop(engine_client, stop_event, callback_sender, config, stats)

@@ -4,9 +4,10 @@ This package ships as a standalone pip-installable plugin that targets a stock
 ``vllm==0.23.*`` wheel. It provides three integration surfaces:
 
 1. ``vllm.general_plugins`` entry point (:func:`gonka_poc.plugin.register`)
-   that registers PoC-aware model configs (e.g. Qwen3MoeForCausalLM custom_ops
-   defaults) in every vLLM process (engine core, workers, inspection
-   subprocess).
+   that sets a process-local ``PLUGIN_LOADED`` flag and installs a one-shot
+   wrapper around ``vllm.entrypoints.openai.api_server.build_app`` so a
+   gate-presence warning fires when the operator runs ``vllm serve`` instead
+   of ``gonka-vllm-serve``.
 2. ``--worker-extension-cls gonka_poc.worker.PoCWorkerExtension`` exposing
    ``execute_poc_forward`` to vLLM's ``collective_rpc`` (replaces the previous
    monkey-patch against ``vllm.v1.engine.async_llm.AsyncLLM``).

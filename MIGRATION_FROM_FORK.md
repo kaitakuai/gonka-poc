@@ -21,13 +21,18 @@ This document records the disposition of every commit on the source branch
 | `9ec7ab432` fix compilation skip | `src/gonka_poc/poc/poc_model_runner.py` (already final state) |
 | `4a4c921f0` add scratchpad (revert) | `src/gonka_poc/poc/poc_model_runner.py` (already final state) |
 | `623ef37d7` feat(api): integrate PoC router and priority gating | `src/gonka_poc/entrypoint/{api_router,gating}.py` + reuse of `src/gonka_poc/poc/routes.py` |
-| `15ee09f11` feat(models): add Qwen3MoeForCausalLMConfig with PoC custom_ops defaults | `src/gonka_poc/models/qwen3_moe_config.py` + `src/gonka_poc/plugin.py` |
 | `8f30fd4e2` chore(api): return token id as numeric string from _get_decoded_token | REPLACED by `src/gonka_poc/poc/routes.py` serialiser (do NOT port the `_get_decoded_token` edit -- emit numeric ids from PoC routes only) |
 | `582f087a5` fix(poc): restore seq_lens_cpu_upper_bound kwarg for MLA attention (#9) | `src/gonka_poc/_compat/v0_23.py::build_common_attention_metadata` |
 | `d16c2127d` test(gonka): port PoC v2 live and unit tests from 0.15.1 fork | `tests/gonka/*` |
 
 The fork commit `99a372d4e` ("safer kv cache reuse") also bumps the
 Dockerfile base image -- the Dockerfile part is **foundry**, see Section 2.
+
+### Not ported to plugin
+
+| SHA | Subject | Rationale |
+|-----|---------|-----------|
+| `15ee09f11` feat(models): add Qwen3MoeForCausalLMConfig with PoC custom_ops defaults | No real PoC-specific `custom_ops` exist for Qwen3MoE today -- the fork's `MODELS_CONFIG_MAP` entry was an aspirational scaffold with no concrete ops. When a real op is needed it will be added explicitly under a fresh module + wired from `plugin.register()`; carrying an empty seed invites confusion. |
 
 ## 2. Foundry-profile commits (land in `mlnode-foundry`)
 
