@@ -7,7 +7,9 @@ Batched forward pass — processes all nonces in a single forward call.
 Private-API touchpoint policy
 -----------------------------
 All ``vllm.v1.*`` private surfaces are routed through the version-dispatched
-compat shim ``gonka_poc._compat.current``:
+compat shim. The import binds the resolver function and each consumer calls
+it to obtain the actual module: ``compat = _current_compat();
+compat.build_common_attention_metadata(...)``. Touchpoints:
     * ``CommonAttentionMetadata`` construction
     * per-layer ``AttentionMetadata`` builder iteration over
       ``model_runner.attn_groups``
@@ -40,7 +42,7 @@ from vllm.forward_context import set_forward_context
 from vllm.sequence import IntermediateTensors
 from vllm.logger import init_logger
 
-from gonka_poc._compat import current as compat
+from gonka_poc._compat import current as _current_compat
 
 from .gpu_random import (
     generate_inputs,
@@ -91,6 +93,7 @@ def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker):
     constructor + per-layer builder iteration over
     ``model_runner.attn_groups``) are routed through ``gonka_poc._compat``.
     """
+    compat = _current_compat()
     blocks_per_seq = math.ceil(seq_len / block_size)
     total_tokens = batch_size * seq_len
 
