@@ -4,6 +4,13 @@ Out-of-tree vLLM plugin implementing **Gonka Proof-of-Compute v2** for stock
 `vllm==0.23.*` wheels. Ships as a single `pip install gonka-poc` -- no fork,
 no source patches.
 
+> **Status (2026-06-16):** Alpha. Plugin code is in active refactor (see PR
+> `mb/feat/arch-refactor-must-fixes`); the sampler residual wheel
+> `vllm==0.23.0+gonka.sampler1` is not yet published to a public index. Until
+> both land, the production path is the legacy `kaitakuai/vllm` fork (not
+> `pip install`). See `MIGRATION_FROM_FORK.md` Section 3 and ADR-0014 for the
+> two-artifact relationship.
+
 ## What it provides
 
 1. **PoC API router** under `/api/v1/pow/*` (init/generate/status/stop) +
@@ -18,7 +25,38 @@ The sampler-stack residual (enforced-token sampling, `logprobs_mode`) is
 **not** part of this plugin -- it remains as a thin fork until vLLM grows a
 sampler-stack hook. See `MIGRATION_FROM_FORK.md`.
 
-## Quick start
+## Host prerequisites
+
+Confirmed minimum versions for the supported deployment matrix:
+
+* **NVIDIA driver** >= 550 (vllm 0.23.0 base image targets cu129)
+* **nvidia-container-toolkit** (Docker/Podman GPU passthrough)
+* **Python** 3.10 -- 3.12
+* **CUDA** 12.9 (matches `vllm/vllm-openai:v0.23.0-cu129`)
+* **GPU memory** >= 80 GB total for the supported model classes
+  (Qwen3-235B-FP8, MiniMax-M2.7-FP8). Per-GPU memory depends on
+  TP/PP layout -- see the hardware matrix below.
+
+## Required runtime configuration
+
+These env vars / flags MUST be set; defaults are wrong or missing:
+
+| Setting | Where | Why |
+|---------|-------|-----|
+| `VLLM_ALLOW_INSECURE_SERIALIZATION=1` | env | Enables msgpack between API process and worker for `collective_rpc` payloads (PoC artifacts ride this channel). |
+| `--worker-extension-cls gonka_poc.worker.PoCWorkerExtension` | CLI | `gonka-vllm-serve` injects this automatically; vanilla `vllm serve` does NOT. |
+| `--attention-backend FLASHINFER` | CLI | Or `TRITON_ATTN` -- see ml-runtime conventions; the default backend is not validated for PoC. |
+| `--logprobs-mode processed_logprobs` | CLI | PoC v2 requires processed (post-temperature, post-top-p) logprobs; raw logprobs break the marker chain. |
+| `--enforce-eager` | CLI | PoC forward MUST run eager -- compiled drift breaks cross-validator bit-compat (see `feedback_poc_eager_mandatory.md`). |
+
+## Quick start (`gonka-vllm-serve`)
+
+`gonka-vllm-serve` is a thin composition wrapper around
+`vllm.entrypoints.openai.api_server`: it accepts every flag stock
+`vllm serve` accepts (it re-uses `make_arg_parser` /
+`validate_parsed_serve_args`). The PoC router and gating middleware are
+inserted between `build_app(...)` and `serve_http(...)` -- no vLLM source
+is patched.
 
 ```bash
 docker run --rm -it --gpus all \
@@ -27,19 +65,149 @@ docker run --rm -it --gpus all \
   vllm/vllm-openai:v0.23.0-cu129 \
   sh -c "pip install gonka-poc && \
          gonka-vllm-serve \
-           --model Qwen/Qwen3-235B-A22B-FP8 \
+           --model <MODEL>  \
            --worker-extension-cls gonka_poc.worker.PoCWorkerExtension \
-           --tensor-parallel-size 4 \
+           --attention-backend FLASHINFER \
+           --logprobs-mode processed_logprobs \
            --enforce-eager \
-           --max-model-len 100000 \
+           --tensor-parallel-size <TP> \
+           --pipeline-parallel-size <PP> \
            --dtype auto"
 ```
 
-`gonka-vllm-serve` is a thin composition wrapper around
-`vllm.entrypoints.openai.api_server`: it accepts every flag stock
-`vllm serve` accepts (it re-uses `make_arg_parser` / `validate_parsed_serve_args`).
-The PoC router and gating middleware are inserted between `build_app(...)`
-and `serve_http(...)` -- no vLLM source is patched.
+Pick `<MODEL>`, `<TP>`, and `<PP>` from the hardware matrix below.
+
+## Supported hardware matrix
+
+| GPU | Model | TP | PP | Notes |
+|-----|-------|----|----|-------|
+| **B200** (8x) | MiniMax M2.7 (FP8) | 2 | 1 | 2624 nonces/min reference (2-replica) |
+| **B300** (1x) | Qwen3-235B FP8 | 1 | 4 | PP=4 on RTX PRO 6000 SE pattern; see ml-runtime |
+| **H100** | MiniMax M2.7 (FP8) | 4 | 1 | requires Hopper-FP8 caveats -- TRITON MoE + FLASHINFER attn |
+| **A100** | MiniMax M2.7 (FP8) | 4 | 1 | requires `--moe-backend marlin` + `VLLM_USE_FLASHINFER_MOE_FP8=0` |
+| **RTX PRO 6000 SE** | Qwen3-235B (FP8) | 1 | 4 | `--max-model-len 100000` |
+
+Validation gate per `feedback_hardware_validation_gate.md`: don't promote
+configs to downstream repos until they pass real-hardware throughput +
+L2-validity checks on the target GPU.
+
+## Chain integration
+
+The PoC router is mounted at `/api/v1/pow/*`. The Gonka chain orchestrator
+posts to these endpoints and is given the same host:port as the OpenAI
+endpoint (the chat/completions endpoints share the listener; the gating
+middleware rejects them with 503 while a PoC round is active).
+
+### `POST /api/v1/pow/init/generate`
+
+Starts a continuous generation round (multi-node, multi-group). Body:
+
+```json
+{
+  "block_hash": "0x...",
+  "block_height": 12345,
+  "public_key": "0x...",
+  "node_id": 0,
+  "node_count": 1,
+  "group_id": 0,
+  "n_groups": 1,
+  "batch_size": 32,
+  "params": { "model": "Qwen/Qwen3-235B-A22B-FP8", "seq_len": 4096, "k_dim": 12 },
+  "url": "https://chain-orchestrator.example/callback",
+  "poc_stronger_rng": false
+}
+```
+
+* `node_id` / `node_count` -- this node's index within the round and total
+  participants. Determines the nonce stride: `offset = node_id + group_id*node_count`.
+* `group_id` / `n_groups` -- group sharding when multiple operator groups
+  participate in the same round (default 0/1). Stride is
+  `step = n_groups * node_count`.
+* `params.model` MUST match the deployed `--model` flag (or one of the
+  `--served-model-name` aliases) -- mismatch returns 409.
+* `url` is the callback prefix. Returns `{"status": "OK", "pow_status": {"status": "GENERATING"}}`.
+
+### `POST /api/v1/pow/generate`
+
+Computes artifacts for a fixed nonce list (either synchronous via
+`wait=true` or queued via `wait=false`). Body shape:
+
+```json
+{
+  "block_hash": "0x...",
+  "block_height": 12345,
+  "public_key": "0x...",
+  "node_id": 0,
+  "node_count": 1,
+  "nonces": [0, 1, 2, ...],
+  "params": { "model": "...", "seq_len": 4096, "k_dim": 12 },
+  "batch_size": 32,
+  "wait": false,
+  "url": "https://chain-orchestrator.example/callback",
+  "validation": { "artifacts": [{"nonce": 0, "vector_b64": "..."}, ...] },
+  "stat_test": { "dist_threshold": 0.4, "p_mismatch": 0.5, "fraud_threshold": 0.05 },
+  "poc_stronger_rng": false
+}
+```
+
+* `wait=false` enqueues and returns `{"status": "queued", "request_id": "..."}`.
+  Pull the result later via `GET /api/v1/pow/generate/{request_id}`.
+* `wait=true` blocks until artifacts are computed; if `validation` is
+  attached, runs the L2 statistical test and returns the verdict inline.
+
+### `GET /api/v1/pow/status`
+
+Returns the current round state. When idle:
+
+```json
+{"status": "IDLE", "config": null, "stats": null}
+```
+
+When generating: includes the current config (block_hash, block_height,
+public_key, node_id, node_count, group_id, n_groups, seq_len, k_dim)
+and live stats (total_processed, nonces_per_second).
+
+### `POST /api/v1/pow/stop`
+
+Cancels the active round, drains the queue, clears callback senders. Idempotent.
+
+### Callback contract
+
+When `url` is provided on `init/generate` or `generate`, the node POSTs
+batched artifacts to `{url}/generated` on a `POC_CALLBACK_INTERVAL_SEC`
+cadence (default 5s). Each callback body carries the public_key,
+block_hash, block_height, node_id, and a list of `{nonce, vector_b64}`
+artifacts in `k_dim`-dimensional FP16 little-endian encoding.
+
+### Pointing the chain orchestrator at the OpenAI endpoint
+
+The OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/completions`,
+`/v1/models`) is served by the same listener. Configure the chain
+orchestrator with the same base URL as the PoC endpoints; the gating
+middleware will return HTTP 503 with header `Retry-After` while PoC
+generation is active, signalling the orchestrator to back off until
+`/api/v1/pow/status` returns `IDLE`.
+
+## Why two artifacts
+
+We ship `gonka-poc` (plugin) + `kaitakuai/vllm` (thin fork) on purpose --
+see **ADR-0014** in this repo's `docs/adr/`. Short version:
+
+* The plugin holds everything reachable through vLLM's public extension
+  surfaces: `vllm.general_plugins` entry point, `--worker-extension-cls`,
+  the FastAPI router composition.
+* The thin fork holds the sampler-stack residual (enforced-token sampling,
+  per-request `logprobs_mode`, structured-output graceful degradation) --
+  these touch private vLLM internals (`vllm/v1/sample/*`,
+  `vllm/v1/structured_output/*`, `vllm/v1/worker/gpu_input_batch.py`) with
+  no public hook today.
+* The fork is rebuilt as `vllm==0.23.0+gonka.samplerN` for each vLLM minor
+  bump. Each upstream PR that adds a hook retires part of the fork; once
+  all three hooks land, the fork is archived and `pip install gonka-poc`
+  becomes the single artifact.
+
+See `MIGRATION_FROM_FORK.md` Section 3 for the per-commit fork inventory
+and the upstream-PR backlog.
 
 ## Layout
 
@@ -55,15 +223,6 @@ tests/
   contract/       -- vLLM private-surface drift detector (read-only)
   gonka/          -- PoC live + unit tests ported from the 0.15.1 fork
 ```
-
-## Runtime requirements
-
-* `vllm >= 0.23.0, < 0.24`
-* `--enforce-eager` -- PoC forward MUST run eager (per
-  `feedback_poc_eager_mandatory.md`). Compiled drift breaks cross-validator
-  bit-compat.
-* GPU profile: confirmed targets B200, B300, RTX PRO 6000 SE (Qwen3-235B-FP8).
-  Validation gate per `feedback_hardware_validation_gate.md`.
 
 ## What's NOT here
 

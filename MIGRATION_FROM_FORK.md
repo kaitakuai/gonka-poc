@@ -82,7 +82,7 @@ each vllm minor bump. Move to plugin only after an upstream PR adds a hook.
 | `1a328700e` | fix(sampler): thread need_processed_logprobs through forward_xpu | `vllm/v1/sample/ops/topk_topp_sampler.py` | Continuation of sampler-op surgery. |
 | `e35461e0e` (structured-output portion not in this commit) | -- | -- | -- |
 | `8f30fd4e2` (the `_get_decoded_token` part) | chore(api): return token id as numeric string | `vllm/...` -- **DROPPED**; replaced by plugin serialiser | Already documented in Section 1; the fork edit itself stays dropped, **not** carried as a residual. |
-| structured-output | feat(structured-output): graceful degradation on grammar token rejection | `vllm/v1/structured_output/__init__.py`, `backend_xgrammar.py` | Private xgrammar internals; ADR layer-3-deferred. |
+| `4996d5af7` | feat(structured-output): graceful degradation on grammar token rejection | `vllm/v1/structured_output/__init__.py`, `vllm/v1/structured_output/backend_xgrammar.py` | Private xgrammar internals; ADR layer-3-deferred. |
 
 ### Upstream-PR backlog (to retire each item from the fork)
 
