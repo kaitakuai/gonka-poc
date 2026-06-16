@@ -11,7 +11,11 @@ mapping in ``gonka_poc/_compat/__init__.py``.
 """
 from __future__ import annotations
 
+import logging
+import warnings
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------- #
@@ -20,42 +24,75 @@ from typing import Any, Optional
 
 def build_common_attention_metadata(
     *,
-    model_runner: Any,
-    seq_len: int,
-    batch_size: int = 32,
-    seq_lens_cpu_upper_bound: Optional[int] = None,
+    query_start_loc: Any,
+    query_start_loc_cpu: Any,
+    seq_lens: Any,
+    num_reqs: int,
+    num_actual_tokens: int,
+    max_query_len: int,
+    max_seq_len: int,
+    block_table_tensor: Any,
+    slot_mapping: Any,
+    causal: bool = True,
+    seq_lens_cpu_upper_bound: Optional[Any] = None,
+    _seq_lens_cpu: Optional[Any] = None,
+    _num_computed_tokens_cpu: Optional[Any] = None,
 ) -> Any:
     """Construct a ``CommonAttentionMetadata`` for a PoC forward pass.
 
     Upstream symbol: ``vllm.v1.attention.backends.utils.CommonAttentionMetadata``
-        (private; constructor signature shifted in v0.20+ to add the
-        ``seq_lens_cpu_upper_bound`` kwarg required by MLA-style backends --
-        see fork commit 582f087a5 "fix(poc): restore seq_lens_cpu_upper_bound
-        kwarg for MLA attention (#9)").
+        (re-exported from ``vllm.v1.attention.backend``; private; constructor
+        signature shifted in v0.20+ to add the ``seq_lens_cpu_upper_bound``
+        kwarg required by MLA-style backends -- see fork commit 582f087a5
+        "fix(poc): restore seq_lens_cpu_upper_bound kwarg for MLA attention
+        (#9)").
 
     Version constraint: vllm == 0.23.*
 
     Contract test:
         tests/contract/test_v0_23_api_surface.py::test_common_attention_metadata_fields
 
-    TODO(layer-2, hardware-validation): finalise the kwarg list once the
-    contract test introspects the actual dataclass on the installed wheel.
-    The fork's call site is in vllm/poc/poc_model_runner.py
-    ``_create_v1_attn_metadata`` -- mirror its signature here.
+    The kwarg list mirrors the fork's ``_create_v1_attn_metadata`` call site at
+    ``vllm/poc/poc_model_runner.py`` (branch mb/feat/port-pocv2-vllm-0.23.0):
+
+        CommonAttentionMetadata(
+            query_start_loc=...,
+            query_start_loc_cpu=...,
+            seq_lens=...,
+            num_reqs=batch_size,
+            num_actual_tokens=batch_size * seq_len,
+            max_query_len=seq_len,
+            max_seq_len=seq_len,
+            block_table_tensor=...,
+            slot_mapping=...,
+            causal=True,
+            _seq_lens_cpu=...,
+            seq_lens_cpu_upper_bound=...,
+            _num_computed_tokens_cpu=torch.zeros(batch_size, ...),
+        )
+
+    Caller (poc_model_runner) is responsible for building the GPU/CPU tensors;
+    this helper is the version-pinned constructor binding only.
     """
-    # TODO: import and call the real CommonAttentionMetadata once contract
-    # test asserts the field set.
-    #
-    #     from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-    #     return CommonAttentionMetadata(
-    #         seq_lens=...,
-    #         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound or seq_len,
-    #         ...
-    #     )
-    raise NotImplementedError(
-        "build_common_attention_metadata: stub. Implementation deferred "
-        "until tests/contract/test_v0_23_api_surface.py pins the dataclass "
-        "field set on the installed vllm wheel."
+    # Import the real dataclass; resolves through utils to keep the contract
+    # test's pin point (vllm.v1.attention.backends.utils.CommonAttentionMetadata)
+    # authoritative.
+    from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+
+    return CommonAttentionMetadata(
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc_cpu,
+        seq_lens=seq_lens,
+        num_reqs=num_reqs,
+        num_actual_tokens=num_actual_tokens,
+        max_query_len=max_query_len,
+        max_seq_len=max_seq_len,
+        block_table_tensor=block_table_tensor,
+        slot_mapping=slot_mapping,
+        causal=causal,
+        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+        _seq_lens_cpu=_seq_lens_cpu,
+        _num_computed_tokens_cpu=_num_computed_tokens_cpu,
     )
 
 
@@ -92,62 +129,124 @@ def get_kv_cache_pool(model_runner: Any) -> list:
 # Engine client abort (used by gating to stop in-flight inference)
 # ---------------------------------------------------------------------------- #
 
+def _list_in_flight_request_ids(engine_client: Any) -> list[str]:
+    """Best-effort enumeration of in-flight request IDs on the EngineClient.
+
+    v0.23 ``EngineClient`` ABC (vllm/engine/protocol.py) does NOT expose a
+    ``list_requests`` / ``get_active_requests`` method. The concrete
+    ``AsyncLLM`` impl (vllm/v1/engine/async_llm.py) keeps state on its
+    ``output_processor.request_states`` dict[str, RequestState] -- that is
+    the only stable hook in v0.23.
+
+    Returns [] if no enumerable surface is available; caller then logs and
+    relies on PoCGatingMiddleware to gate new requests instead.
+    """
+    # Path 1: AsyncLLM output_processor (v1 engine).
+    op = getattr(engine_client, "output_processor", None)
+    if op is not None:
+        states = getattr(op, "request_states", None)
+        if isinstance(states, dict):
+            # Snapshot keys so concurrent mutation during abort doesn't raise.
+            return list(states.keys())
+    # Path 2: legacy v0 engine (kept for defensive fallback; should not hit
+    # in a 0.23-only deployment but harmless if a wrapped client appears).
+    engine = getattr(engine_client, "engine", None)
+    if engine is not None:
+        scheduler = getattr(engine, "scheduler", None)
+        if scheduler is not None:
+            # scheduler may be a list (per-vp) or a single instance.
+            schedulers = scheduler if isinstance(scheduler, list) else [scheduler]
+            ids: list[str] = []
+            for sch in schedulers:
+                for queue_name in ("running", "waiting", "swapped"):
+                    queue = getattr(sch, queue_name, None) or []
+                    for seq_group in queue:
+                        rid = getattr(seq_group, "request_id", None)
+                        if rid is not None:
+                            ids.append(str(rid))
+            return ids
+    return []
+
+
 async def abort_all_requests(engine_client: Any) -> int:
     """Abort every in-flight inference request before PoC seizes the GPU.
 
-    Upstream symbol: ``vllm.engine.protocol.EngineClient.abort`` (public-ish;
-        method signature ``async def abort(request_id: str | Iterable[str])``).
+    Upstream symbol: ``vllm.engine.protocol.EngineClient.abort`` (ABC method;
+        ``async def abort(request_id: str | Iterable[str]) -> None``).
 
     Version constraint: vllm == 0.23.*
 
     Contract test:
         tests/contract/test_v0_23_api_surface.py::test_engine_client_has_abort
 
-    Returns number of requests aborted (best-effort).
+    Returns: number of requests aborted (best-effort).
 
-    TODO(layer-1): list active requests on the EngineClient first -- in
-    v0.23 the API is ``engine_client.list_requests()`` or
-    ``engine_client.get_lora_requests()`` depending on minor; contract test
-    pins the symbol.
+    CALLER NOTE: v0.23 ``EngineClient`` ABC has no public ``list_requests``
+    API. We introspect the concrete ``AsyncLLM.output_processor.request_states``
+    dict. If that surface vanishes in a future minor, this function returns 0
+    and logs a warning -- PoCGatingMiddleware alone is sufficient to gate new
+    requests (this abort path is belt-and-suspenders for already-admitted
+    requests still mid-decode).
     """
-    # Stub: real implementation iterates app.state.openai_serving_chat /
-    # _completion in-flight request_ids and calls engine_client.abort(...).
-    return 0
+    abort_fn = getattr(engine_client, "abort", None)
+    if abort_fn is None:
+        logger.warning(
+            "abort_all_requests: engine_client has no .abort method "
+            "(expected per EngineClient ABC v0.23) -- skipping."
+        )
+        return 0
+
+    request_ids = _list_in_flight_request_ids(engine_client)
+    if not request_ids:
+        logger.warning(
+            "abort_all_requests: no enumerable in-flight requests on "
+            "engine_client (output_processor.request_states unavailable). "
+            "PoCGatingMiddleware still blocks new admissions."
+        )
+        return 0
+
+    aborted = 0
+    for rid in request_ids:
+        try:
+            # EngineClient.abort accepts a single id or an iterable; we issue
+            # per-id calls so one bad id does not abort the rest of the loop.
+            await abort_fn(rid)
+            aborted += 1
+        except Exception as exc:  # noqa: BLE001 -- best-effort, never raise
+            logger.warning(
+                "abort_all_requests: abort(%s) failed: %s", rid, exc
+            )
+    return aborted
 
 
 # ---------------------------------------------------------------------------- #
-# Model runner forward bind (one-shot install)
+# Model runner forward bind (DEFERRED-BY-DESIGN)
 # ---------------------------------------------------------------------------- #
 
 def install_model_runner_forward_hook(model_runner: Any, hook: Any) -> None:
-    """Rebind ``model_runner.execute_model`` or ``.model.forward`` so PoC
-    intercepts the live serving forward, if needed.
+    """Deprecated no-op -- kept for import compatibility.
 
-    Upstream symbol: ``vllm.v1.worker.gpu_model_runner.GPUModelRunner.execute_model``
-        (private; per-step entry from MultiprocExecutor).
+    The PoC v2 architecture on 0.23 invokes ``PoCWorkerExtension.execute_poc_forward``
+    out-of-band via ``collective_rpc``; it does NOT intercept the per-step
+    serving forward. This hook is therefore deferred-by-design.
 
-    Version constraint: vllm == 0.23.*
-
-    Contract test:
-        tests/contract/test_v0_23_api_surface.py::test_execute_model_signature
-
-    NOTE: this is only required if PoC needs to intercept the per-step
-    forward. The default path (PoCWorkerExtension.execute_poc_forward
-    invoked out-of-band via collective_rpc) does NOT need this hook.
+    If a future architecture revision needs per-step interception, restore an
+    implementation that rebinds ``GPUModelRunner.execute_model`` and add a
+    contract test (``tests/contract/test_v0_23_api_surface.py::
+    test_execute_model_signature``) that pins the upstream signature.
     """
-    # TODO(layer-2): implement once we decide whether PoC v2 on 0.23 still
-    # needs per-step interception or can live entirely off the collective_rpc
-    # entry point.
-    raise NotImplementedError(
-        "install_model_runner_forward_hook: TODO -- only needed if PoC "
-        "intercepts the live serving forward in addition to the "
-        "out-of-band collective_rpc path."
+    warnings.warn(
+        "install_model_runner_forward_hook is a deferred-by-design no-op on "
+        "vllm 0.23.x (PoC v2 uses out-of-band collective_rpc, not per-step "
+        "forward interception). Calling this function has no effect.",
+        DeprecationWarning,
+        stacklevel=2,
     )
+    return None
 
 
 __all__ = [
     "build_common_attention_metadata",
     "get_kv_cache_pool",
     "abort_all_requests",
-    "install_model_runner_forward_hook",
 ]
