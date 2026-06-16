@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -233,7 +233,7 @@ async def _compute_artifacts_chunk(
     k_dim: int,
     poc_stronger_rng: bool = False,
     timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
-    check_cancelled: Optional[callable] = None,
+    check_cancelled: Optional[Callable[[], bool]] = None,
 ) -> List[Dict]:
     """Compute artifacts for a chunk with backoff on skip."""
     chunk_start_time = time.time()
@@ -285,7 +285,13 @@ async def _generation_loop(
     stats["total_processed"] = 0
     last_report_time = start_time
     
-    logger.info(f"PoC generation started (node {config['node_id']}/{config['node_count']}, group {config['group_id']}/{config['n_groups']})")
+    logger.info(
+        "PoC generation started (node %s/%s, group %s/%s)",
+        config["node_id"],
+        config["node_count"],
+        config["group_id"],
+        config["n_groups"],
+    )
     skip_count = 0
     timeout_count = 0
     pending_nonces = None
@@ -311,7 +317,7 @@ async def _generation_loop(
             except TimeoutError:
                 timeout_count += 1
                 if timeout_count == 1 or timeout_count % 10 == 0:
-                    logger.warning(f"PoC timed out (#{timeout_count}), engine busy")
+                    logger.warning("PoC timed out (#%s), engine busy", timeout_count)
                 pending_nonces = nonces
                 await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC * 2)
                 continue
@@ -319,7 +325,7 @@ async def _generation_loop(
             if result.get("skipped"):
                 skip_count += 1
                 if skip_count % 100 == 1:
-                    logger.debug(f"PoC yielding to chat (skip #{skip_count})")
+                    logger.debug("PoC yielding to chat (skip #%s)", skip_count)
                 pending_nonces = nonces
                 await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
                 continue
@@ -343,14 +349,22 @@ async def _generation_loop(
             if current_time - last_report_time >= 5.0:
                 elapsed_min = (current_time - start_time) / 60
                 rate = stats["total_processed"] / elapsed_min if elapsed_min > 0 else 0
-                logger.info(f"Generated: {stats['total_processed']} nonces ({rate:.0f}/min)")
+                logger.info(
+                    "Generated: %s nonces (%.0f/min)",
+                    stats["total_processed"],
+                    rate,
+                )
                 last_report_time = current_time
-            
+
     except asyncio.CancelledError:
         elapsed_min = (time.time() - start_time) / 60
-        logger.info(f"PoC stopped: {stats['total_processed']} nonces in {elapsed_min:.2f}min")
+        logger.info(
+            "PoC stopped: %s nonces in %.2fmin",
+            stats["total_processed"],
+            elapsed_min,
+        )
     except Exception as e:
-        logger.error(f"PoC generation crashed: {e}", exc_info=True)
+        logger.error("PoC generation crashed: %s", e, exc_info=True)
         raise
 
 
@@ -361,7 +375,13 @@ async def _generation_loop(
 @router.post("/init/generate")
 async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     global _poc_generation_active
-    logger.info(f"PoC /init/generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.group_id}, {body.n_groups}, {body.batch_size}, {body.params}, {body.url}, {body.poc_stronger_rng}")
+    # Do NOT log the full body (public_key, callback url, params are sensitive
+    # or noisy). Stick to a stable identity pair: node and batch size.
+    logger.info(
+        "PoC /init/generate: node_id=%s, batch_size=%s",
+        body.node_id,
+        body.batch_size,
+    )
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
 
@@ -431,7 +451,13 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
 
 @router.post("/generate")
 async def generate(request: Request, body: PoCGenerateRequest) -> dict:
-    logger.info(f"PoC /generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.nonces}, {body.params}, {body.batch_size}, {body.wait}, {body.url}, {body.validation}, {body.stat_test}, {body.poc_stronger_rng}")
+    # Do NOT log the full body (nonces list can be huge, public_key/url are
+    # sensitive). Log only size + node id for traceability.
+    logger.info(
+        "PoC /generate: node_id=%s, nonces=%d",
+        body.node_id,
+        len(body.nonces),
+    )
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
     
@@ -492,7 +518,12 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     
     total_nonces = len(body.nonces)
     n_chunks = (total_nonces + body.batch_size - 1) // body.batch_size
-    logger.info(f"PoC /generate: {total_nonces} nonces, batch_size={body.batch_size}, chunks={n_chunks}")
+    logger.info(
+        "PoC /generate: %d nonces, batch_size=%d, chunks=%d",
+        total_nonces,
+        body.batch_size,
+        n_chunks,
+    )
     
     start_time = time.time()
     computed_artifacts = []
@@ -514,13 +545,23 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 POC_GENERATE_CHUNK_TIMEOUT_SEC, check_cancelled
             )
             computed_artifacts.extend(artifacts)
-            logger.debug(f"PoC /generate: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
+            logger.debug(
+                "PoC /generate: chunk %d/%d done (%d nonces)",
+                chunk_idx + 1,
+                n_chunks,
+                len(chunk),
+            )
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
     
     elapsed = time.time() - start_time
     rate = total_nonces / elapsed if elapsed > 0 else 0
-    logger.info(f"PoC /generate completed: {total_nonces} nonces in {elapsed:.2f}s ({rate:.0f}/s)")
+    logger.info(
+        "PoC /generate completed: %d nonces in %.2fs (%.0f/s)",
+        total_nonces,
+        elapsed,
+        rate,
+    )
     
     if not body.validation:
         return {

@@ -52,6 +52,15 @@ def register() -> None:
     if _registered:
         return
 
+    # Expose a process-local flag so the FastAPI startup-event hook in
+    # ``gonka_poc.entrypoint.api_router`` can detect "plugin loaded but no
+    # gate attached" (operator likely ran plain ``vllm serve`` instead of
+    # ``gonka-vllm-serve``). Set BEFORE the inner registration steps so
+    # the flag survives even if a sub-step raises.
+    import gonka_poc as _pkg  # local import: avoid cycles at module import
+
+    _pkg.PLUGIN_LOADED = True
+
     try:
         _register_models()
     except Exception:  # pragma: no cover - defensive
@@ -63,6 +72,13 @@ def register() -> None:
         _register_custom_ops()
     except Exception:  # pragma: no cover
         logger.exception("gonka_poc.plugin.register: custom_ops import failed")
+
+    try:
+        _install_build_app_warning_wrapper()
+    except Exception:  # pragma: no cover
+        logger.exception(
+            "gonka_poc.plugin.register: build_app warning wrapper install failed"
+        )
 
     _registered = True
 
@@ -84,7 +100,7 @@ def _register_models() -> None:
 
     The "<module>:<class>" form avoids importing torch at plugin load time.
     """
-    # TODO(layer-1): if we end up shipping a Qwen3MoeForCausalLMPoC subclass,
+    # NOTE(layer-1): if we end up shipping a Qwen3MoeForCausalLMPoC subclass,
     # register it here. For now this is a no-op so the function still has a
     # stable call site for tests.
     from vllm import ModelRegistry  # deferred import
@@ -103,9 +119,63 @@ def _register_custom_ops() -> None:
     Until layer-1 PoC custom_ops land, this is a no-op so plugin
     registration stays cheap.
     """
-    # TODO(layer-1): create gonka_poc/custom_ops/__init__.py with the OOT
+    # NOTE(layer-1): create gonka_poc/custom_ops/__init__.py with the OOT
     # decorators and `import gonka_poc.custom_ops  # noqa: F401` here.
     return None
+
+
+_build_app_wrapped: bool = False
+
+
+def _install_build_app_warning_wrapper() -> None:
+    """Wrap ``vllm.entrypoints.openai.api_server.build_app`` with a one-shot
+    startup-event registrar.
+
+    Purpose: catch the operator footgun where ``vllm serve`` runs instead of
+    ``gonka-vllm-serve``. The plugin's :func:`register` still executes (so
+    PoC custom_ops / model defaults are seeded) but no
+    ``app.state.gonka_gate`` is ever attached -- the chat endpoint would NOT
+    be 503-gated while PoC seizes the GPU.
+
+    We mutate the upstream module so the wrapper is in effect for both the
+    bare ``vllm serve`` invocation and our own ``gonka-vllm-serve`` path
+    (where the wrapper just no-ops on top of an already-registered hook).
+
+    Best-effort: if vllm or its api_server module is not importable in this
+    process (e.g. a worker subprocess where the entrypoint isn't even
+    referenced), we silently skip.
+    """
+    global _build_app_wrapped
+    if _build_app_wrapped:
+        return
+
+    try:
+        from vllm.entrypoints.openai import api_server as _api_server  # type: ignore
+    except Exception:
+        # No api_server in this process -- engine-core / worker / inspection
+        # subprocesses don't need this hook. Not an error.
+        return
+
+    original_build_app = getattr(_api_server, "build_app", None)
+    if original_build_app is None:
+        return
+
+    def _wrapped_build_app(*args, **kwargs):  # type: ignore[no-untyped-def]
+        app = original_build_app(*args, **kwargs)
+        try:
+            from gonka_poc.entrypoint.api_router import (
+                register_gate_presence_warning,
+            )
+
+            register_gate_presence_warning(app)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "gonka_poc: failed to attach gate-presence warning to FastAPI app"
+            )
+        return app
+
+    _api_server.build_app = _wrapped_build_app  # type: ignore[assignment]
+    _build_app_wrapped = True
 
 
 __all__ = ["register"]

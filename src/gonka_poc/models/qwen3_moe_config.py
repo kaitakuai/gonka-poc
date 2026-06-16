@@ -18,7 +18,7 @@ from typing import Iterable, List, Sequence
 # Custom-ops tail added by the v0.15.1 fork commit 15ee09f11. Each entry is a
 # string in vLLM's ``+op`` / ``-op`` notation (custom_ops field semantics).
 #
-# TODO(layer-1, hardware-validation): finalise the exact custom_ops list once
+# NOTE(layer-1, hardware-validation): finalise the exact custom_ops list once
 # we have a B200 / RTX PRO 6000 SE run on vllm 0.23.0 confirming which ops
 # survive the upstream rewrites. Per project_b300_qwen235b_fp8 memory the
 # upstream MoE backend selection has shifted (FlashInfer / TRITON / DeepGEMM)
@@ -58,7 +58,7 @@ def apply_qwen3_moe_poc_defaults(vllm_config: object) -> bool:
 
     Bound late so we don't import vllm at plugin-registration time.
     """
-    # TODO(layer-1): swap to vllm.config import paths once contract test
+    # NOTE(layer-1): swap to vllm.config import paths once contract test
     # pins ModelConfig.architecture and CompilationConfig.custom_ops names.
     model_cfg = getattr(vllm_config, "model_config", None)
     if model_cfg is None:
@@ -86,7 +86,7 @@ def apply_qwen3_moe_poc_defaults(vllm_config: object) -> bool:
         compile_cfg.custom_ops = merged
     except AttributeError:
         # Some dataclass variants are frozen; fall back to setattr via
-        # __dict__ as a last resort. TODO(layer-1): confirm CompilationConfig
+        # __dict__ as a last resort. NOTE(layer-1): confirm CompilationConfig
         # mutability in v0.23.0 contract test.
         compile_cfg.__dict__["custom_ops"] = merged
     return True

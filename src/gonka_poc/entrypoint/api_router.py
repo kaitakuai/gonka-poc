@@ -28,18 +28,31 @@ is open.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
+import signal
 import sys
-from typing import Any
+from typing import Any, Iterable, Optional
 
 # fastapi import is cheap; vllm imports are deferred to ``main`` so that
 # ``--help`` / argparse error paths don't fork the engine.
 from fastapi import FastAPI
 
-from gonka_poc.entrypoint.gating import PoCGate, PoCGatingMiddleware
+from gonka_poc.entrypoint.gating import (
+    DEFAULT_BLOCKED_PREFIXES,
+    PoCGate,
+    PoCGatingMiddleware,
+)
 
 logger = logging.getLogger("gonka_poc.entrypoint")
+
+
+def _interrupt_init(signum: int, frame: Any) -> None:  # pragma: no cover - signal path
+    """SIGTERM handler mirroring upstream ``api_server._interrupt_init``.
+
+    Translates SIGTERM into a KeyboardInterrupt so the uvloop event loop
+    unwinds cleanly via the same path as Ctrl-C.
+    """
+    raise KeyboardInterrupt("gonka-vllm-serve received SIGTERM")
 
 
 def attach_poc_router(app: FastAPI) -> None:
@@ -51,13 +64,50 @@ def attach_poc_router(app: FastAPI) -> None:
     app.include_router(poc_router)
 
 
-def build_gonka_app(app: FastAPI, *, gate: PoCGate) -> FastAPI:
+def register_gate_presence_warning(app: FastAPI) -> None:
+    """Attach a FastAPI startup hook that warns when the plugin is loaded
+    without the gating middleware installed.
+
+    This catches the operator footgun where ``vllm serve`` runs instead of
+    ``gonka-vllm-serve``: the plugin entry point still executes (so models /
+    custom_ops get registered) but no ``app.state.gonka_gate`` is set and the
+    chat endpoint will NOT be 503-gated while PoC seizes the GPU.
+
+    Invoked both from :func:`build_gonka_app` (where the warning never fires
+    -- the gate is always present by construction) AND from a build_app
+    wrapper installed by :func:`gonka_poc.plugin.register` (where the warning
+    will fire because plain ``vllm serve`` never attached a gate).
+    """
+
+    @app.on_event("startup")
+    async def _gonka_gate_presence_warning() -> None:  # pragma: no cover - startup hook
+        import gonka_poc
+
+        plugin_loaded = bool(getattr(gonka_poc, "PLUGIN_LOADED", False))
+        gate_present = getattr(app.state, "gonka_gate", None) is not None
+        if plugin_loaded and not gate_present:
+            logger.warning(
+                "gonka_poc plugin loaded but app.state.gonka_gate is missing -- "
+                "PoC chat-completion gating is DISABLED. "
+                "Did you launch with `vllm serve` instead of `gonka-vllm-serve`?"
+            )
+
+
+def build_gonka_app(
+    app: FastAPI,
+    *,
+    gate: PoCGate,
+    blocked_prefixes: Optional[Iterable[str]] = None,
+) -> FastAPI:
     """Mutate the upstream-built FastAPI app: add PoC router + gating middleware.
 
     Args:
         app: the FastAPI instance returned by
             ``vllm.entrypoints.openai.api_server.build_app(args, ...)``.
         gate: the shared :class:`PoCGate` flag toggled by the PoC router.
+        blocked_prefixes: optional override for the path prefixes the gating
+            middleware 503s while PoC is active. ``None`` uses
+            :data:`gonka_poc.entrypoint.gating.DEFAULT_BLOCKED_PREFIXES`.
 
     Returns:
         The same ``app`` instance (mutated). Returned for chainability.
@@ -72,7 +122,17 @@ def build_gonka_app(app: FastAPI, *, gate: PoCGate) -> FastAPI:
     # Install the gating middleware LAST (so it runs FIRST per Starlette's
     # reverse-insertion ordering). MUST be called before app starts -- which
     # is true here since we run before ``serve_http``.
-    app.add_middleware(PoCGatingMiddleware, gate=gate)
+    prefixes = (
+        tuple(blocked_prefixes)
+        if blocked_prefixes is not None
+        else DEFAULT_BLOCKED_PREFIXES
+    )
+    app.add_middleware(PoCGatingMiddleware, gate=gate, blocked_prefixes=prefixes)
+
+    # Register the startup-event hook AFTER the gate is attached. Here it is
+    # a defensive no-op (gate IS present), but the same callback installed by
+    # the plugin's ``build_app`` wrapper fires in the bare-``vllm serve`` case.
+    register_gate_presence_warning(app)
 
     return app
 
@@ -85,6 +145,7 @@ async def _run_server(args: Any) -> None:
     """
     # Deferred imports: keep ``gonka-vllm-serve --help`` fast and isolated
     # from CUDA fork issues.
+    import vllm.envs as envs
     from vllm.entrypoints.openai.api_server import (
         build_app,
         build_async_engine_client,
@@ -104,7 +165,11 @@ async def _run_server(args: Any) -> None:
 
         # Gonka composition: PoC router + gating middleware.
         gate = PoCGate()
-        build_gonka_app(app, gate=gate)
+        build_gonka_app(
+            app,
+            gate=gate,
+            blocked_prefixes=getattr(args, "gonka_poc_block_prefixes", None),
+        )
 
         # Standard upstream state population (sets app.state.engine_client and
         # app.state.openai_serving_*). MUST run after build_app and after we
@@ -119,7 +184,7 @@ async def _run_server(args: Any) -> None:
             host=args.host,
             port=args.port,
             log_level=getattr(args, "uvicorn_log_level", "info"),
-            timeout_keep_alive=getattr(args, "timeout_keep_alive", 5),
+            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
             ssl_keyfile=getattr(args, "ssl_keyfile", None),
             ssl_certfile=getattr(args, "ssl_certfile", None),
             ssl_ca_certs=getattr(args, "ssl_ca_certs", None),
@@ -160,13 +225,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     validate_parsed_serve_args(args)
 
-    # NB: we don't pass --gonka-poc-block-prefixes through ``args`` into the
-    # middleware yet; left as TODO for layer-1 wiring once foundry profile
-    # confirms the exact set of routes that need 503-gating in production.
-    # See MIGRATION_FROM_FORK.md (foundry stage-3).
+    # Mirror upstream ``api_server.run_server``: translate SIGTERM into the
+    # same shutdown path as Ctrl-C so the event loop unwinds the engine
+    # cleanly instead of being torn down mid-step.
+    signal.signal(signal.SIGTERM, _interrupt_init)
+
+    # uvloop.run is the upstream parity choice (matches
+    # ``vllm.entrypoints.openai.api_server.__main__``). Deferred so the
+    # ``--help`` path stays light on a system without uvloop.
+    import uvloop  # type: ignore[import-not-found]
 
     try:
-        asyncio.run(_run_server(args))
+        uvloop.run(_run_server(args))
     except KeyboardInterrupt:
         logger.info("gonka-vllm-serve interrupted; shutting down")
         return 130

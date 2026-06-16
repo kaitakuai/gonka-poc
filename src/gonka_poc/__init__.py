@@ -20,3 +20,9 @@ from the source branch.
 """
 
 __version__ = "0.1.0a0"
+
+# Set to True by :func:`gonka_poc.plugin.register` (the
+# ``vllm.general_plugins`` entry point) so a FastAPI startup hook can detect
+# "plugin loaded but no gate attached" (operator likely ran plain
+# ``vllm serve`` instead of ``gonka-vllm-serve``).
+PLUGIN_LOADED: bool = False
