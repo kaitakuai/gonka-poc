@@ -1,0 +1,44 @@
+name: grep-lint
+
+# Process-gate: fail PRs that
+#   (a) reach into ``vllm.v1.*`` from outside ``src/gonka_poc/_compat/``
+#       (the only blessed, version-dispatched channel for upstream
+#       internals -- see tools/grep_lint.py docstring), or
+#   (b) cite an ``ADR-NNNN`` whose file is not present under ``docs/adr/``
+#       (stale references mislead reviewers).
+#
+# Pure stdlib script, no install step needed beyond the ubuntu-latest
+# default python3.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "LICENSE"
+      - ".gitignore"
+  pull_request:
+    paths-ignore:
+      - "LICENSE"
+      - ".gitignore"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: grep-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  grep-lint:
+    name: grep-lint (private vllm.v1 / stale ADR refs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run grep-lint
+        # The script uses stdlib only -- no setup-python step required.
+        # ubuntu-latest's bundled python3 is >=3.10, which is enough.
+        run: python3 tools/grep_lint.py
