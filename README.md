@@ -1,13 +1,12 @@
 # gonka-poc
 
 Out-of-tree vLLM plugin implementing **Gonka Proof-of-Compute v2** for stock
-`vllm==0.23.*` wheels. Ships as a single `pip install gonka-poc` -- no fork,
-no source patches.
+`vllm==0.23.*` wheels. Ships as a Python package -- no fork, no source patches.
 
-> **Status (2026-06-16):** Alpha. Plugin code is in active refactor (see PR
-> `mb/feat/arch-refactor-must-fixes`); the sampler residual wheel
-> `vllm==0.23.0+gonka.sampler1` is not yet published to a public index. Until
-> both land, the production path is the legacy `kaitakuai/vllm` fork (not
+> **Status (2026-06-17):** Alpha. The package is **not yet on PyPI**; install
+> directly from git (see Quick start below). The sampler residual wheel
+> `vllm==0.23.0+gonka.sampler1` is also not on a public index. Until both
+> land, the production path is the legacy `kaitakuai/vllm` fork (not
 > `pip install`). See `MIGRATION_FROM_FORK.md` Section 3 and ADR-0014 for the
 > two-artifact relationship.
 
@@ -47,7 +46,7 @@ These env vars / flags MUST be set; defaults are wrong or missing:
 | Setting | Where | Why |
 |---------|-------|-----|
 | `VLLM_ALLOW_INSECURE_SERIALIZATION=1` | env | Enables msgpack between API process and worker for `collective_rpc` payloads (PoC artifacts ride this channel). |
-| `--worker-extension-cls gonka_poc.worker.PoCWorkerExtension` | CLI | `gonka-vllm-serve` injects this automatically; vanilla `vllm serve` does NOT. |
+| `--worker-extension-cls gonka_poc.worker.PoCWorkerExtension` | CLI | Operator MUST pass this flag explicitly on `gonka-vllm-serve` (and on vanilla `vllm serve`). `gonka-vllm-serve` does NOT inject it -- we considered auto-injection but argparse mutation across the nested vLLM helpers (`make_arg_parser` / `validate_parsed_serve_args` / `FlexibleArgumentParser`) is fragile and silently breaks `--help` and unknown-flag handling. Forgetting the flag means PoC `collective_rpc` calls land on a default worker with no `execute_poc_forward` method (loud failure on first PoC round, not silent). |
 | `--attention-backend FLASHINFER` | CLI | Or `TRITON_ATTN` -- see ml-runtime conventions; the default backend is not validated for PoC. |
 | `--logprobs-mode processed_logprobs` | CLI | PoC v2 requires processed (post-temperature, post-top-p) logprobs; raw logprobs break the marker chain. |
 | `--enforce-eager` | CLI | PoC forward MUST run eager -- compiled drift breaks cross-validator bit-compat (see `feedback_poc_eager_mandatory.md`). |
@@ -61,12 +60,22 @@ These env vars / flags MUST be set; defaults are wrong or missing:
 inserted between `build_app(...)` and `serve_http(...)` -- no vLLM source
 is patched.
 
+> **Install path:** `gonka-poc` is **not yet on PyPI**. Install directly
+> from GitHub with `pip install git+https://github.com/kaitakuai/gonka-poc@main`
+> (pin to a tag once releases land, e.g. `@v0.1.0`). The Quick start below
+> uses this form. The `pip install gonka-poc` shorthand will start working
+> once we publish to a Python index.
+
+> **Required flag:** `--worker-extension-cls gonka_poc.worker.PoCWorkerExtension`
+> MUST be passed on the CLI. `gonka-vllm-serve` does NOT auto-inject it (see
+> the Required runtime configuration table above for the rationale).
+
 ```bash
 docker run --rm -it --gpus all \
   -p 8000:8000 \
   -e VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
   vllm/vllm-openai:v0.23.0-cu129 \
-  sh -c "pip install gonka-poc && \
+  sh -c "pip install 'git+https://github.com/kaitakuai/gonka-poc@main' && \
          gonka-vllm-serve \
            --model <MODEL>  \
            --worker-extension-cls gonka_poc.worker.PoCWorkerExtension \
@@ -79,6 +88,12 @@ docker run --rm -it --gpus all \
 ```
 
 Pick `<MODEL>`, `<TP>`, and `<PP>` from the hardware matrix below.
+
+The `--worker-extension-cls` flag is the **public** vLLM extension surface
+that exposes `PoCWorkerExtension.execute_poc_forward` to the API process via
+`collective_rpc`. Omit it and the first `/api/v1/pow/init/generate` call
+crashes with `AttributeError: 'Worker' object has no attribute
+'execute_poc_forward'`.
 
 ## Supported hardware matrix
 
