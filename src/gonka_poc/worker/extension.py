@@ -44,6 +44,11 @@ from typing import Any, Dict, List, Optional
 # NOTE: keep imports light at module scope -- this file is imported in every
 # worker process during init_worker. Heavy imports (torch, gonka_poc.poc.*)
 # are deferred into method bodies.
+#
+# ``gonka_poc._compat`` is intentionally light (pure-Python dispatcher) so
+# it's safe to import at module scope; routing kv_caches access through the
+# shim keeps the documented private-API touchpoint policy honest.
+from gonka_poc._compat import current as _current
 
 
 class PoCWorkerExtension:
@@ -162,13 +167,20 @@ class PoCWorkerExtension:
         """Report KV-cache tensor shape/dtype for the compat shim to verify.
 
         Returns a small dict only; do NOT return the tensors themselves.
+
+        Routes through ``compat.get_kv_cache_pool`` (instead of raw
+        ``getattr``) so every kv_caches access in the package goes through
+        the documented shim. The shim raises ``RuntimeError`` when the
+        attribute is missing/None; we translate that into the existing
+        ``{"available": False}`` diagnostic shape so callers (CLI probes,
+        contract tests) keep working unchanged.
         """
-        kv_caches = (
-            getattr(self.model_runner, "kv_caches", None)
-            if hasattr(self, "model_runner")
-            else None
-        )
-        if kv_caches is None:
+        if not hasattr(self, "model_runner"):
+            return {"available": False}
+        compat = _current()
+        try:
+            kv_caches = compat.get_kv_cache_pool(self.model_runner)
+        except RuntimeError:
             return {"available": False}
         if not kv_caches:
             return {"available": True, "n_layers": 0}
