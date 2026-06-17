@@ -164,6 +164,32 @@ def test_cli_args_helpers() -> None:
         )
 
 
+def test_flexible_argument_parser_import_path() -> None:
+    """``FlexibleArgumentParser`` MUST be importable from
+    ``vllm.utils.argparse_utils`` on v0.22+/v0.23.
+
+    Background: pre-0.22 ``vllm/utils.py`` was a flat module that exported
+    ``FlexibleArgumentParser`` directly. In 0.22.0 ``vllm.utils`` became a
+    package; the symbol moved to ``vllm.utils.argparse_utils`` and is NOT
+    re-exported from the package ``__init__.py``. The legacy import
+    ``from vllm.utils import FlexibleArgumentParser`` raises ImportError
+    at runtime (the smoke-help job caught exactly this against the 0.23.0
+    pin). ``gonka_poc.entrypoint.api_router.main`` now imports from the
+    canonical location with a fallback to the flat path; this contract
+    test gives the smoke-help job a symbol-level guard so regressions
+    surface in unit-CI rather than the heavier subprocess job.
+    """
+    pytest.importorskip("vllm")
+    mod = importlib.import_module("vllm.utils.argparse_utils")
+    cls = getattr(mod, "FlexibleArgumentParser", None)
+    assert cls is not None and inspect.isclass(cls), (
+        "vllm.utils.argparse_utils.FlexibleArgumentParser missing -- "
+        "gonka_poc.entrypoint.api_router.main needs revision "
+        "(currently falls back to vllm.utils.FlexibleArgumentParser, "
+        "which is also gone in 0.22+/0.23)."
+    )
+
+
 def test_cli_env_setup_import_path() -> None:
     """``cli_env_setup`` MUST be importable from
     ``vllm.entrypoints.serve.utils.api_utils`` on v0.23.

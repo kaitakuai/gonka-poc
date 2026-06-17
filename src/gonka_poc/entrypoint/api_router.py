@@ -242,7 +242,15 @@ def main(argv: list[str] | None = None) -> int:
         make_arg_parser,
         validate_parsed_serve_args,
     )
-    from vllm.utils import FlexibleArgumentParser
+    # ``FlexibleArgumentParser`` moved out of the flat ``vllm/utils.py`` module
+    # into ``vllm.utils.argparse_utils`` in v0.22.0+ and is NOT re-exported from
+    # the ``vllm.utils`` package ``__init__.py``. Try the canonical location
+    # first, fall back to the legacy flat path for older wheels or any future
+    # re-export. Mirrors the ``cli_env_setup`` try/except pattern below.
+    try:
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+    except ImportError:  # pragma: no cover - legacy/future re-export fallback
+        from vllm.utils import FlexibleArgumentParser  # type: ignore[no-redef]
 
     # ``cli_env_setup`` MUST run before we hand off to uvloop. Upstream calls
     # it at the very top of ``vllm/entrypoints/openai/api_server.py:__main__``

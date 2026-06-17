@@ -1,0 +1,236 @@
+"""Exception-path unit tests for ``init_generate``'s gate-cleanup contract.
+
+Background -- the v3 architecture re-review (Stream B fixture issue) flagged
+that ``init_generate`` flips the PoC gate ON *before* it has a generation
+task whose done-callback would flip it OFF. If anything between
+``gate.activate(...)`` and ``gen_task.add_done_callback(...)`` raises:
+
+    gate.activate("init-generate")           # ON
+    compat = _current()                      # <-- may raise
+    aborted = await compat.abort_all_requests(...)  # <-- may raise
+    gen_task = asyncio.create_task(...)      # <-- may raise
+
+...the gate latches ON forever -- no task exists yet, so no done-callback
+ever fires the corresponding ``gate.deactivate()``. The HTTP server then
+503s every chat/completion request from that point on, with no way back.
+
+The Stream B fix wraps the three offending calls in a try/except that
+calls ``gate.deactivate()`` on any exception before re-raising. These
+tests pin that contract:
+
+  * test_init_generate_compat_raises_deactivates_gate
+        ``gonka_poc.poc.routes._current`` raises RuntimeError.
+        Expected: gate ends up DEACTIVATED, exception propagates.
+
+  * test_init_generate_abort_raises_deactivates_gate
+        ``compat.abort_all_requests`` raises RuntimeError.
+        Expected: gate ends up DEACTIVATED, exception propagates.
+
+  * test_init_generate_spawn_raises_deactivates_gate
+        ``asyncio.create_task`` raises RuntimeError (or the inner
+        ``_generation_loop`` raises before yielding -- either path lands
+        in the same try-block).
+        Expected: gate ends up DEACTIVATED, exception propagates.
+
+If Stream B has landed, these tests pass. If Stream D landed first
+(this file with no production fix), every test fails -- and that IS the
+gate working: the failures localize the missing fix to one production
+path instead of a tail of integration symptoms.
+
+Why no ``vllm`` import / engine: the gate object is a pure-Python flag
+defined in ``gonka_poc.entrypoint.gating``; we mount a minimal FastAPI
+app with just enough state for ``_get_gate`` to find it. ``engine_client``
+is a Mock that survives a single ``getattr(...)`` lookup. This keeps the
+test CPU-only and < 1s.
+"""
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi import FastAPI
+
+# ``gonka_poc.poc.routes`` transitively imports scipy via
+# ``gonka_poc.poc.data`` (binomtest). scipy is a vllm transitive dep in
+# production / CI, but a stripped-down dev install may skip it. Importing
+# routes at module collection time would surface as a hard collection
+# error -- skip the whole module instead so a thin install can still run
+# the rest of ``tests/unit`` cleanly.
+pytest.importorskip("scipy", reason="scipy required by gonka_poc.poc.data")
+
+from gonka_poc.entrypoint.gating import PoCGate  # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# Fixture: a wired app that ``init_generate`` can run against.
+#
+# init_generate's prerequisites (from src/gonka_poc/poc/routes.py:423-503):
+#   * request.app.state.gonka_gate  -- PoCGate instance
+#   * request.app.state.engine_client  -- anything truthy (we use AsyncMock)
+#   * request.app.state.openai_serving_models / poc_deployed -- absent => skip
+#     the check_params_match validation
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def gate() -> PoCGate:
+    """Fresh inactive gate for each test."""
+    return PoCGate()
+
+
+@pytest.fixture
+def app(gate: PoCGate) -> FastAPI:
+    """Minimal app carrying the state ``init_generate`` reads from request.app."""
+    a = FastAPI()
+    a.state.gonka_gate = gate
+    # Truthy sentinel so ``get_engine_client`` returns it instead of 503ing.
+    a.state.engine_client = AsyncMock()
+    # Absent on purpose: ``check_params_match`` early-returns when
+    # ``openai_serving_models`` and ``poc_deployed`` are both falsy.
+    return a
+
+
+def _make_request(app: FastAPI) -> Any:
+    """Build a stand-in ``fastapi.Request`` whose only attribute we touch is
+    ``.app``. ``init_generate`` reads ``request.app.state.*`` and nothing else
+    from the Request object until generation actually runs, which these
+    failure-mode tests never reach.
+    """
+    req = MagicMock()
+    req.app = app
+    return req
+
+
+def _make_body() -> Any:
+    """Mirror ``PoCInitGenerateRequest`` minimally -- a duck-typed dataclass
+    is enough because ``check_params_match`` is a no-op against this app
+    fixture (no ``openai_serving_models`` / ``poc_deployed`` set), so the
+    body only has to expose the attributes the logging line reads BEFORE the
+    gate flip:
+
+        body.block_hash, body.block_height, body.public_key, body.node_id,
+        body.node_count, body.group_id, body.n_groups, body.batch_size,
+        body.params (with .model/.seq_len/.k_dim), body.url, body.poc_stronger_rng
+    """
+    params = MagicMock(model="m", seq_len=8, k_dim=12)
+    body = MagicMock(
+        block_hash="bh",
+        block_height=1,
+        public_key="pk",
+        node_id=0,
+        node_count=1,
+        group_id=0,
+        n_groups=1,
+        batch_size=1,
+        params=params,
+        url=None,
+        poc_stronger_rng=False,
+    )
+    return body
+
+
+def _run(coro):
+    """Run an async coroutine to completion on a private event loop.
+
+    We do NOT use ``pytest-asyncio`` so this file stays compatible with the
+    ``pytest`` baseline declared in ``pyproject.toml``'s ``[project.optional-
+    dependencies].test`` group (which DOES install pytest-asyncio but we want
+    a hard floor: this test must run even on a stripped-down install).
+    """
+    return asyncio.run(coro)
+
+
+# --------------------------------------------------------------------------- #
+# Tests
+# --------------------------------------------------------------------------- #
+
+
+def test_init_generate_compat_raises_deactivates_gate(
+    app: FastAPI, gate: PoCGate
+) -> None:
+    """``_current()`` raises => gate MUST be deactivated before the exception
+    propagates.
+
+    Failure here = the production try/except wrapper is missing or did not
+    cover the compat-dispatch lookup. The HTTP server would 503 every chat
+    request from this point forward.
+    """
+    from gonka_poc.poc import routes
+
+    request = _make_request(app)
+    body = _make_body()
+
+    with patch.object(routes, "_current", side_effect=RuntimeError("compat boom")):
+        with pytest.raises(RuntimeError, match="compat boom"):
+            _run(routes.init_generate(request, body))
+
+    assert gate.is_active() is False, (
+        "Gate latched ON after _current() raised. The production code must "
+        "wrap activate -> _current -> abort -> create_task in a try/except "
+        "that calls gate.deactivate() on failure (see Stream B fix)."
+    )
+
+
+def test_init_generate_abort_raises_deactivates_gate(
+    app: FastAPI, gate: PoCGate
+) -> None:
+    """``compat.abort_all_requests`` raises => gate MUST be deactivated.
+
+    Models: vllm's ``EngineClient.abort_request`` raising due to an engine
+    shutdown race, OR the compat shim wrapping it with a guard that itself
+    fails. Both surface as an exception out of ``abort_all_requests``.
+    """
+    from gonka_poc.poc import routes
+
+    request = _make_request(app)
+    body = _make_body()
+
+    fake_compat = MagicMock()
+    fake_compat.abort_all_requests = AsyncMock(
+        side_effect=RuntimeError("abort boom")
+    )
+
+    with patch.object(routes, "_current", return_value=fake_compat):
+        with pytest.raises(RuntimeError, match="abort boom"):
+            _run(routes.init_generate(request, body))
+
+    assert gate.is_active() is False, (
+        "Gate latched ON after abort_all_requests raised. "
+        "Wrap activate -> abort -> create_task in try/except + deactivate."
+    )
+
+
+def test_init_generate_spawn_raises_deactivates_gate(
+    app: FastAPI, gate: PoCGate
+) -> None:
+    """``asyncio.create_task`` raises => gate MUST be deactivated.
+
+    Models the (rare) case where the running event loop is cancelled or
+    the spawned coroutine raises synchronously during scheduling. Practically
+    the same bug surface as the previous two tests, but tests the THIRD
+    failure point in the activate -> abort -> spawn sequence -- the one
+    closest to the happy path, where it is easiest to forget the wrapper.
+    """
+    from gonka_poc.poc import routes
+
+    request = _make_request(app)
+    body = _make_body()
+
+    fake_compat = MagicMock()
+    fake_compat.abort_all_requests = AsyncMock(return_value=0)
+
+    with patch.object(routes, "_current", return_value=fake_compat):
+        with patch.object(
+            routes.asyncio,
+            "create_task",
+            side_effect=RuntimeError("spawn boom"),
+        ):
+            with pytest.raises(RuntimeError, match="spawn boom"):
+                _run(routes.init_generate(request, body))
+
+    assert gate.is_active() is False, (
+        "Gate latched ON after asyncio.create_task raised. The wrapper must "
+        "cover the spawn call too -- not just the dispatch / abort steps."
+    )
