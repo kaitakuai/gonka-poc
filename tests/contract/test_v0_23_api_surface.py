@@ -121,6 +121,141 @@ def test_engine_client_has_abort() -> None:
 
 
 # ---------------------------------------------------------------------------- #
+# EngineClient runtime data-plane (collective_rpc / get_supported_tasks /
+# model_config) -- the every-PoC-round call path
+# ---------------------------------------------------------------------------- #
+
+def test_engine_client_runtime_surface() -> None:
+    """Pin the EngineClient runtime data-plane the plugin hits on every PoC round.
+
+    Three surfaces are pinned here, each backed by a real consumer in the
+    plugin source tree. A future vLLM bump that drifts any of these MUST
+    surface in unit-CI rather than crash the first PoC request:
+
+        (a) ``EngineClient.collective_rpc(method, timeout, args, kwargs)``
+            consumed by:
+              * src/gonka_poc/poc/routes.py (compute artifacts per chunk)
+              * src/gonka_poc/worker/extension.py
+                (await async_llm.collective_rpc("execute_poc_forward", ...))
+            -- the PoC dispatch path. If kwargs is renamed/reshaped, every
+            PoC forward fails.
+
+        (b) ``EngineClient.get_supported_tasks() -> tuple[str, ...]``
+            consumed by:
+              * src/gonka_poc/entrypoint/api_router.py
+                (``supported_tasks = await engine_client.get_supported_tasks()``)
+            -- called once at gonka-vllm-serve init to wire up routes.
+
+        (c) ``EngineClient.model_config: ModelConfig``
+            consumed by:
+              * src/gonka_poc/entrypoint/api_router.py
+                (``model_config = engine_client.model_config`` to read
+                ``max_model_len`` etc. for route limits)
+            On the EngineClient ABC this is a class-level annotation
+            ``model_config: ModelConfig`` (not a property nor an
+            @abstractmethod). The concrete ``vllm.v1.engine.async_llm.AsyncLLM``
+            sets it as an instance attribute in ``__init__`` via
+            ``self.model_config = vllm_config.model_config``. We pin BOTH:
+            the annotation on the ABC declares the contract; an absence on
+            AsyncLLM would mean the concrete class no longer satisfies it.
+    """
+    pytest.importorskip("vllm")
+    mod = importlib.import_module("vllm.engine.protocol")
+    cls = getattr(mod, "EngineClient", None)
+    assert cls is not None, "EngineClient ABC missing"
+
+    # ---- (a) collective_rpc -------------------------------------------------
+    collective_rpc = getattr(cls, "collective_rpc", None)
+    assert collective_rpc is not None and callable(collective_rpc), (
+        "EngineClient.collective_rpc missing -- "
+        "src/gonka_poc/poc/routes.py and src/gonka_poc/worker/extension.py "
+        "issue ``await engine_client.collective_rpc('execute_poc_forward', ...)`` "
+        "on every PoC round; without it the PoC dispatch path is dead."
+    )
+    assert inspect.iscoroutinefunction(collective_rpc), (
+        "EngineClient.collective_rpc is no longer a coroutine -- "
+        "src/gonka_poc/poc/routes.py and src/gonka_poc/worker/extension.py "
+        "await it; if it's now sync the await sites must change."
+    )
+    rpc_params = set(inspect.signature(collective_rpc).parameters)
+    required_rpc = {"method", "timeout", "args", "kwargs"}
+    missing_rpc = required_rpc - rpc_params
+    assert not missing_rpc, (
+        f"EngineClient.collective_rpc signature drifted: missing {sorted(missing_rpc)!r}, "
+        f"present = {sorted(rpc_params)!r}. "
+        f"src/gonka_poc/poc/routes.py:64 and src/gonka_poc/worker/extension.py:21 "
+        f"pass these as keyword args; rename / removal breaks the PoC dispatch."
+    )
+
+    # ---- (b) get_supported_tasks --------------------------------------------
+    gst = getattr(cls, "get_supported_tasks", None)
+    assert gst is not None and callable(gst), (
+        "EngineClient.get_supported_tasks missing -- "
+        "src/gonka_poc/entrypoint/api_router.py:172 calls "
+        "``await engine_client.get_supported_tasks()`` at gonka-vllm-serve "
+        "init to wire up routes; without it serve init crashes."
+    )
+    assert inspect.iscoroutinefunction(gst), (
+        "EngineClient.get_supported_tasks is no longer a coroutine -- "
+        "src/gonka_poc/entrypoint/api_router.py awaits it."
+    )
+    gst_params = inspect.signature(gst).parameters
+    assert len(gst_params) == 1 and "self" in gst_params, (
+        f"EngineClient.get_supported_tasks acquired non-self parameters: "
+        f"{list(gst_params)!r}. "
+        f"src/gonka_poc/entrypoint/api_router.py calls it with no args; "
+        f"either the call site must pass the new args or the compat shim "
+        f"must wrap it."
+    )
+
+    # ---- (c) model_config ----------------------------------------------------
+    # The ABC declares ``model_config: ModelConfig`` as a class-level
+    # annotation (not a @property, not an @abstractmethod). Pin both the
+    # annotation on the ABC and the instance-attribute set-site on the
+    # concrete AsyncLLM, so either kind of drift surfaces here.
+    abc_annotations = getattr(cls, "__annotations__", {}) or {}
+    assert "model_config" in abc_annotations, (
+        f"EngineClient.model_config annotation missing from ABC; "
+        f"present annotations = {sorted(abc_annotations)!r}. "
+        f"src/gonka_poc/entrypoint/api_router.py:173 does "
+        f"``model_config = engine_client.model_config`` to read max_model_len "
+        f"etc.; if the contract no longer requires this attribute, every "
+        f"concrete impl is free to omit it."
+    )
+    # The annotation type SHOULD be ModelConfig (from vllm.config).
+    from vllm.config import ModelConfig as _ModelConfig  # noqa: WPS433
+    annotated_type = abc_annotations.get("model_config")
+    assert annotated_type is _ModelConfig, (
+        f"EngineClient.model_config annotation drifted from "
+        f"vllm.config.ModelConfig to {annotated_type!r}; "
+        f"src/gonka_poc/entrypoint/api_router.py reads ModelConfig fields "
+        f"(max_model_len, etc.) and will break if the type changes."
+    )
+
+    # Concrete impl: AsyncLLM (the v1 path serve uses) MUST also expose
+    # model_config -- either as a class attribute, a property, or an instance
+    # attribute set in __init__. We can't instantiate the engine here, so
+    # check the __init__ source for the set-site.
+    async_llm_mod = importlib.import_module("vllm.v1.engine.async_llm")
+    async_llm = getattr(async_llm_mod, "AsyncLLM", None)
+    assert async_llm is not None, (
+        "vllm.v1.engine.async_llm.AsyncLLM missing -- "
+        "gonka-vllm-serve cannot wire model_config without it."
+    )
+    has_attr = (
+        "model_config" in (getattr(async_llm, "__annotations__", {}) or {})
+        or isinstance(getattr(async_llm, "model_config", None), property)
+        or "self.model_config" in inspect.getsource(async_llm.__init__)
+    )
+    assert has_attr, (
+        "AsyncLLM no longer sets ``self.model_config`` in __init__ nor "
+        "exposes it as a class attribute/property -- "
+        "src/gonka_poc/entrypoint/api_router.py:173 will raise AttributeError "
+        "on the very first request."
+    )
+
+
+# ---------------------------------------------------------------------------- #
 # worker_extension_cls injection point
 # ---------------------------------------------------------------------------- #
 
