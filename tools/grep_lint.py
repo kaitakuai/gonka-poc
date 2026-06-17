@@ -28,6 +28,12 @@ Scope / scan rules:
     fixing it (rephrase to ``vllm.v1.<thing>`` without ``from``/``import``
     keywords, OR drop the dotted path) is bounded; a hidden import is the
     bug we are gating against.
+  - For (a) only: an inline pragma ``# grep-lint: ignore`` anywhere on the
+    same line suppresses the finding. Reserved for legacy test code that
+    pre-dates the ``_compat`` channel and cannot trivially be routed
+    through it (e.g. tests that import a specific private symbol to
+    monkey-patch). The pragma does NOT suppress rule (b) -- a stale ADR
+    reference is a documentation defect that no inline comment justifies.
 
 Stdlib only. No third-party deps -- CI runs on bare ubuntu-latest with
 ``python3``.
@@ -239,6 +245,14 @@ def _scan_file(
             if _is_comment_line(raw):
                 skip_for_private = True
             elif is_markdown and in_fence and fence_lang in FENCED_NONCODE_LANGS:
+                skip_for_private = True
+            # Inline pragma. ``# grep-lint: ignore`` (anywhere on the line)
+            # suppresses rule (a) on that single line. Intended for legacy
+            # test code that pre-dates the compat-channel rule; new code
+            # should still go through ``_compat``. The pragma deliberately
+            # does NOT suppress rule (b) -- a wrong ADR reference is a doc
+            # defect that an exempt-comment cannot justify.
+            elif "grep-lint: ignore" in raw:
                 skip_for_private = True
 
             if not skip_for_private and RE_PRIVATE_VLLM_V1.search(raw):
