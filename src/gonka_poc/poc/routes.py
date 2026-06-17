@@ -277,6 +277,20 @@ async def _cancel_poc_tasks(app_id: int):
                 await tasks["gen_task"]
             except asyncio.CancelledError:
                 pass
+        # Cancel the callback aiohttp loop too. Previously this key was
+        # stored at init time but never read here -- the textbook
+        # store-but-not-read pattern. On re-init / shutdown the loop kept
+        # POSTing until the process died. stop_event is already set above;
+        # that should let run() exit cleanly, but cancel as a belt-and-
+        # braces measure for the mid-POST case.
+        if tasks.get("callback_task"):
+            cb_task = tasks["callback_task"]
+            if not cb_task.done():
+                cb_task.cancel()
+                try:
+                    await cb_task
+                except (asyncio.CancelledError, Exception):
+                    pass
         if tasks.get("callback_sender"):
             tasks["callback_sender"].clear()
 
@@ -452,9 +466,6 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
 
     callback_sender = None
     callback_task = None
-    if body.url:
-        callback_sender = CallbackSender(body.url, stop_event, body.params.k_dim)
-        callback_task = asyncio.create_task(callback_sender.run())
 
     # Activate the gate BEFORE creating the task so PoCGatingMiddleware
     # starts returning 503 to /v1/chat/completions and /v1/completions
@@ -467,8 +478,18 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     # Wrap activate -> abort -> spawn in try/except that deactivates the
     # gate on any exception before re-raising. The done-callback below
     # handles deactivation for the post-spawn happy path.
+    #
+    # Also: spawn callback_task INSIDE the try-block so an exception between
+    # spawn and the _poc_tasks store does not orphan the aiohttp loop --
+    # without this, CallbackSender.run() would keep hammering body.url
+    # forever (no stop_event signal, no cancel, no termination short of
+    # a process restart). See v4 must-fix #5.
     gate.activate("init-generate")
     try:
+        if body.url:
+            callback_sender = CallbackSender(body.url, stop_event, body.params.k_dim)
+            callback_task = asyncio.create_task(callback_sender.run())
+
         # Abort any already-admitted chat/completions requests that snuck in
         # before the gate flipped. PoCGatingMiddleware blocks NEW admissions;
         # abort_all_requests() drains the in-flight set so PoC forwards run on
@@ -500,6 +521,26 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
         # Anything between activate() and add_done_callback() failing means
         # the done-callback path will never deactivate. Deactivate here so
         # the gate does not latch ON across operator retries.
+        #
+        # If callback_task was spawned before the failure (body.url set +
+        # compat / abort / spawn raised), tear it down too: set the
+        # stop_event so CallbackSender.run() exits its loop cleanly, wait a
+        # bounded time for in-flight aiohttp POST to wrap up, then cancel
+        # if it overran. 5.0s is a pragmatic ceiling -- long enough for a
+        # mid-flight POST + one backoff sleep, short enough that operator
+        # retries (which call this same path) do not stack.
+        if callback_task is not None:
+            stop_event.set()
+            try:
+                await asyncio.wait_for(callback_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                callback_task.cancel()
+                try:
+                    await callback_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except (asyncio.CancelledError, Exception):
+                pass
         gate.deactivate()
         logger.exception(
             "PoC init: failed between gate.activate() and task spawn; "

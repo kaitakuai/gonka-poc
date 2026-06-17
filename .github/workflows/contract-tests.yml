@@ -154,3 +154,49 @@ jobs:
           assert callable(cli_env_setup), 'cli_env_setup is not callable'
           print('cli_env_setup import OK')
           "
+
+      - name: import gonka_poc.poc.* (runtime-dep coverage)
+        # Closes v4 must-fix #3 (MAJOR): the smoke-help job previously had
+        # ZERO coverage of the ``gonka_poc.poc`` subpackage, so missing
+        # runtime deps that the poc.* modules transitively require
+        # (e.g. fix-A's scipy / aiohttp regression) slipped through CI.
+        #
+        # Each line below probes a distinct dep-surface:
+        #   * ``poc.routes`` / ``poc.data`` / ``poc.callbacks`` -- the three
+        #     poc submodules touched by the API router on startup.
+        #   * ``poc.data.fraud_test`` -- pulls scipy (statistical fraud
+        #     tests). A missing scipy dep raises ModuleNotFoundError here.
+        #   * ``poc.callbacks.CallbackSender`` -- pulls aiohttp (async HTTP
+        #     client for PoC callbacks). A missing aiohttp dep raises
+        #     ModuleNotFoundError here.
+        run: |
+          python -c "from gonka_poc.poc import routes, data, callbacks; print('poc imports OK')"
+          python -c "from gonka_poc.poc.data import fraud_test; print('data.fraud_test OK')"
+          python -c "from gonka_poc.poc.callbacks import CallbackSender; print('callbacks.CallbackSender OK')"
+
+      - name: vllm.general_plugins entry-point discovery + invocation
+        # Closes v4 must-fix #3 (MAJOR): the smoke-help job previously had
+        # ZERO coverage of the plugin entry-point. ``gonka-vllm-serve`` was
+        # smoke-tested, but plain ``vllm serve`` users rely on vLLM
+        # enumerating ``entry_points(group='vllm.general_plugins')`` and
+        # loading our ``gonka_poc.plugin:register`` -- a pyproject typo or
+        # a wheel-packaging regression would silently disable the gating
+        # warning + PLUGIN_LOADED flag in production.
+        #
+        # The probe enumerates the entry-point group, asserts the entry
+        # exists with the expected target string, .load()s it, and invokes
+        # it twice to verify the idempotency guard in
+        # ``gonka_poc.plugin.register`` (``_registered`` module-global).
+        run: |
+          python -c "
+          from importlib.metadata import entry_points
+          eps = list(entry_points(group='vllm.general_plugins'))
+          ep = next((e for e in eps if e.name == 'gonka_poc'), None)
+          assert ep is not None, f'gonka_poc entry-point not registered; got: {[e.name for e in eps]}'
+          assert ep.value == 'gonka_poc.plugin:register', f'Wrong target: {ep.value}'
+          register = ep.load()
+          assert callable(register), 'register is not callable after entry-point load'
+          register()  # first call -- sets _registered=True, may wrap build_app
+          register()  # second call -- must hit idempotency guard and no-op
+          print('entry-point: gonka_poc -> gonka_poc.plugin:register OK + invocation OK')
+          "

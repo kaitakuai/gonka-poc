@@ -66,6 +66,13 @@ is patched.
 > uses this form. The `pip install gonka-poc` shorthand will start working
 > once we publish to a Python index.
 
+> **First-class runtime deps:** the install pulls `scipy>=1.10` (used by
+> `gonka_poc.poc.data` for the binomial mismatch test) and `aiohttp>=3.9`
+> (used by `gonka_poc.poc.callbacks` for the chain-orchestrator POST loop).
+> These were previously leeched from vLLM's transitive closure; they are
+> now declared explicitly so a broken install fails fast at `pip install`
+> time rather than at the first `/api/v1/pow/init/generate` request.
+
 > **Required flag:** `--worker-extension-cls gonka_poc.worker.PoCWorkerExtension`
 > MUST be passed on the CLI. `gonka-vllm-serve` does NOT auto-inject it (see
 > the Required runtime configuration table above for the rationale).
