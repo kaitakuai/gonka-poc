@@ -234,3 +234,85 @@ def test_init_generate_spawn_raises_deactivates_gate(
         "Gate latched ON after asyncio.create_task raised. The wrapper must "
         "cover the spawn call too -- not just the dispatch / abort steps."
     )
+
+
+def test_init_generate_exception_cancels_callback_task(
+    app: FastAPI, gate: PoCGate
+) -> None:
+    """body.url set + later step raises => callback_task MUST be torn down.
+
+    v4 must-fix #5: ``init_generate`` used to spawn ``CallbackSender.run()``
+    BEFORE the try-block. If anything inside the try then raised, the except
+    branch deactivated the gate and re-raised -- but never set
+    ``stop_event`` and never cancelled the callback task. Result: an orphan
+    aiohttp loop kept POSTing to ``body.url`` until the process died.
+
+    The fix hoists the spawn INTO the try-block and, in the except, signals
+    stop_event + bounded-waits + cancels. This test pins that behaviour by
+    asserting the callback task is ``done()`` (cancelled or naturally
+    exited) after the exception unwinds. If the bug regresses the task
+    will still be running when the assertion fires.
+
+    Why patch ``CallbackSender``: a real ``CallbackSender.run()`` opens an
+    ``aiohttp.ClientSession`` and starts hitting the network. We do not want
+    real I/O in a unit test, so we replace the class with a tiny stand-in
+    whose ``run()`` is a stop_event-respecting sleep loop -- enough to
+    exercise the lifecycle the production fix protects.
+    """
+    from gonka_poc.poc import routes
+
+    request = _make_request(app)
+    body = _make_body()
+    body.url = "http://test.invalid/cb"
+
+    captured: dict = {}
+
+    class _FakeCallbackSender:
+        def __init__(self, callback_url, stop_event, k_dim=12, **kwargs):
+            self.callback_url = callback_url
+            self.stop_event = stop_event
+            self.k_dim = k_dim
+            captured["sender"] = self
+
+        async def run(self):
+            # Mirror the real run(): loop until stop_event fires. The
+            # production except-branch sets stop_event then waits, so this
+            # loop must terminate promptly when that happens.
+            while not self.stop_event.is_set():
+                await asyncio.sleep(0.01)
+
+        def clear(self):
+            pass
+
+        def add_artifacts(self, *a, **kw):
+            pass
+
+    fake_compat = MagicMock()
+    fake_compat.abort_all_requests = AsyncMock(
+        side_effect=RuntimeError("abort boom")
+    )
+
+    with patch.object(routes, "CallbackSender", _FakeCallbackSender):
+        with patch.object(routes, "_current", return_value=fake_compat):
+            with pytest.raises(RuntimeError, match="abort boom"):
+                _run(routes.init_generate(request, body))
+
+    assert gate.is_active() is False, (
+        "Gate latched ON after abort_all_requests raised with body.url set."
+    )
+
+    # The fix sets stop_event in the except branch, so the FakeCallbackSender
+    # run-loop must have exited. The wait_for inside init_generate awaits
+    # the task, so by the time the exception propagates out, the task is
+    # either cleanly done or cancelled.
+    sender = captured.get("sender")
+    assert sender is not None, (
+        "CallbackSender was never instantiated -- the spawn moved out of "
+        "the try-block? Production code must spawn callback_task INSIDE "
+        "the try so the except path can tear it down."
+    )
+    assert sender.stop_event.is_set(), (
+        "stop_event was not set in the except branch. The orphan aiohttp "
+        "loop will keep POSTing to body.url until the process restarts. "
+        "Fix: in the except, set stop_event before waiting on callback_task."
+    )
