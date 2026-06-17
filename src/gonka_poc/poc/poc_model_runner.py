@@ -255,7 +255,20 @@ def execute_poc_forward(
     inputs_embeds = None
 
     if pp_group.is_first_rank:
-        kv_caches = getattr(worker.model_runner, "kv_caches", [])
+        # Route through the compat shim instead of raw getattr so future
+        # vLLM minors that rename ``model_runner.kv_caches`` can be
+        # adapted in one place (gonka_poc._compat.v0_23.get_kv_cache_pool).
+        # The shim raises if kv_caches isn't populated -- worker
+        # initialise_kv_caches() must run before any PoC forward, so a
+        # missing pool here is a real bug, not a silent fall-through.
+        # Note: get_kv_cache_pool can raise if the worker has not yet
+        # initialised the KV pool; in that case fall back to the generated
+        # inputs path (same effect as the previous empty-list default).
+        compat = _current_compat()
+        try:
+            kv_caches = compat.get_kv_cache_pool(worker.model_runner)
+        except RuntimeError:
+            kv_caches = []
         needed_elems = batch_size * seq_len * hidden_size
         kv_scratch = _select_poc_kv_scratch(
             kv_caches, dtype, needed_elems, batch_size, seq_len, hidden_size,

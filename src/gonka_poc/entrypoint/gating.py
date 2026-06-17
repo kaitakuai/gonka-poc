@@ -38,6 +38,13 @@ class PoCGate:
     router serialises start/stop).
     """
 
+    # Single source of truth for the 503 retry hint. The HTTP ``Retry-After``
+    # header is delta-seconds (RFC 9110 section 10.2.3) and the JSON body
+    # carries the same value in milliseconds. Keeping both derived from one
+    # constant prevents the 10x drift that confused orchestrators in the
+    # original code (header "1" second vs body "100" ms).
+    RETRY_AFTER_SECONDS: int = 1
+
     def __init__(self) -> None:
         self._active: bool = False
         self._reason: Optional[str] = None
@@ -105,14 +112,19 @@ class PoCGatingMiddleware:
         if self.gate.is_active():
             path: str = scope.get("path", "")
             if any(path.startswith(prefix) for prefix in self.blocked_prefixes):
+                # Derive both header (delta-seconds) and body (milliseconds)
+                # from the single PoCGate.RETRY_AFTER_SECONDS constant so
+                # the two cannot drift. Previous code had header "1" (sec)
+                # but body "100" (ms) -- a 10x mismatch.
+                retry_after_seconds = PoCGate.RETRY_AFTER_SECONDS
                 response = JSONResponse(
                     status_code=503,
                     content={
                         "error": "poc_generation_active",
                         "reason": self.gate.reason or "poc-generation",
-                        "retry_after_ms": 100,
+                        "retry_after_ms": retry_after_seconds * 1000,
                     },
-                    headers={"Retry-After": "1"},
+                    headers={"Retry-After": str(retry_after_seconds)},
                 )
                 await response(scope, receive, send)
                 return

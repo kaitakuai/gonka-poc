@@ -460,35 +460,52 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     # starts returning 503 to /v1/chat/completions and /v1/completions
     # immediately. The gate is the single source of truth for "PoC is
     # currently running" -- no module-level flag.
+    #
+    # CRITICAL: gate.activate() flips ON before any guarded call. If the
+    # compat lookup or abort_all_requests raises, the gate would latch ON
+    # forever (no done-callback registered yet because no task spawned).
+    # Wrap activate -> abort -> spawn in try/except that deactivates the
+    # gate on any exception before re-raising. The done-callback below
+    # handles deactivation for the post-spawn happy path.
     gate.activate("init-generate")
+    try:
+        # Abort any already-admitted chat/completions requests that snuck in
+        # before the gate flipped. PoCGatingMiddleware blocks NEW admissions;
+        # abort_all_requests() drains the in-flight set so PoC forwards run on
+        # an exclusively-owned GPU. Ordering contract (ADR-0013): gate.activate
+        # -> abort_all_requests -> spawn gen task. This depends on the compat
+        # dispatch shim (fix #1) for the `current()` module lookup.
+        compat = _current()
+        aborted = await compat.abort_all_requests(engine_client)
+        logger.info(
+            "PoC init: aborted %d in-flight requests before generation", aborted
+        )
 
-    # Abort any already-admitted chat/completions requests that snuck in
-    # before the gate flipped. PoCGatingMiddleware blocks NEW admissions;
-    # abort_all_requests() drains the in-flight set so PoC forwards run on
-    # an exclusively-owned GPU. Ordering contract (ADR-0013): gate.activate
-    # -> abort_all_requests -> spawn gen task. This depends on the compat
-    # dispatch shim (fix #1) for the `current()` module lookup.
-    compat = _current()
-    aborted = await compat.abort_all_requests(engine_client)
-    logger.info(
-        "PoC init: aborted %d in-flight requests before generation", aborted
-    )
+        gen_task = asyncio.create_task(
+            _generation_loop(engine_client, stop_event, callback_sender, config, stats)
+        )
 
-    gen_task = asyncio.create_task(
-        _generation_loop(engine_client, stop_event, callback_sender, config, stats)
-    )
+        def _on_generation_done(task: asyncio.Task):
+            gate.deactivate()
+            if task.cancelled():
+                logger.info("PoC generation task cancelled, gate deactivated")
+            elif task.exception():
+                logger.warning("PoC generation task failed, gate deactivated: %s",
+                               task.exception())
+            else:
+                logger.info("PoC generation task completed, gate deactivated")
 
-    def _on_generation_done(task: asyncio.Task):
+        gen_task.add_done_callback(_on_generation_done)
+    except Exception:
+        # Anything between activate() and add_done_callback() failing means
+        # the done-callback path will never deactivate. Deactivate here so
+        # the gate does not latch ON across operator retries.
         gate.deactivate()
-        if task.cancelled():
-            logger.info("PoC generation task cancelled, gate deactivated")
-        elif task.exception():
-            logger.warning("PoC generation task failed, gate deactivated: %s",
-                           task.exception())
-        else:
-            logger.info("PoC generation task completed, gate deactivated")
-
-    gen_task.add_done_callback(_on_generation_done)
+        logger.exception(
+            "PoC init: failed between gate.activate() and task spawn; "
+            "gate deactivated (init-generate-failed) before re-raising"
+        )
+        raise
     
     _poc_tasks[app_id] = {
         "gen_task": gen_task,

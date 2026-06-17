@@ -218,9 +218,9 @@ def test_503_body_is_json_with_retry_after(
 
     assert r.status_code == 503
     body = r.json()
-    # Assert the actual shape returned by gating.py:86-93. If a future
-    # refactor restructures the body, this fails loudly so downstream
-    # consumers (CLI, Gonka network node) can be updated in sync.
+    # Assert the actual shape returned by gating.py. If a future refactor
+    # restructures the body, this fails loudly so downstream consumers
+    # (CLI, Gonka network node) can be updated in sync.
     assert body["error"] == "poc_generation_active"
     assert body["reason"] == "custom-reason-string"
     assert isinstance(body["retry_after_ms"], int)
@@ -228,10 +228,23 @@ def test_503_body_is_json_with_retry_after(
     retry_after = r.headers.get("retry-after")
     assert retry_after is not None, "Retry-After header missing on 503"
     # HTTP spec: Retry-After is either a numeric (delta-seconds) or HTTP-date.
-    # gating.py emits a numeric string ("1") -- assert that shape.
+    # gating.py emits a numeric string -- assert that shape.
     assert retry_after.isdigit(), (
         f"Retry-After must be numeric delta-seconds, got {retry_after!r}"
     )
+
+    # The header (delta-seconds) and the body (milliseconds) MUST be derived
+    # from the same source of truth -- the original code had Retry-After: 1
+    # but retry_after_ms: 100 (a 10x mismatch) which confused orchestrators
+    # that read one and obeyed the other. PoCGate.RETRY_AFTER_SECONDS is the
+    # canonical constant; verify both fields trace back to it.
+    assert body["retry_after_ms"] == int(retry_after) * 1000, (
+        f"Retry-After header ({retry_after!r} sec) and retry_after_ms body "
+        f"({body['retry_after_ms']} ms) disagree -- check the PoCGate."
+        f"RETRY_AFTER_SECONDS derivation in gating.py."
+    )
+    assert body["retry_after_ms"] == PoCGate.RETRY_AFTER_SECONDS * 1000
+    assert int(retry_after) == PoCGate.RETRY_AFTER_SECONDS
 
 
 # --------------------------------------------------------------------------- #
