@@ -120,13 +120,18 @@ def build_gonka_app(
     app.state.gonka_gate = gate
 
     # Install the gating middleware LAST (so it runs FIRST per Starlette's
-    # reverse-insertion ordering). MUST be called before app starts -- which
-    # is true here since we run before ``serve_http``.
+    # reverse-insertion ordering).
     prefixes = (
         tuple(blocked_prefixes)
         if blocked_prefixes is not None
         else DEFAULT_BLOCKED_PREFIXES
     )
+    # Starlette 1.3.x (shipped with vLLM 0.23) finalizes the middleware stack
+    # eagerly, so add_middleware() after build_app raises "Cannot add middleware
+    # after an application has started". Reset the stack so Starlette rebuilds it
+    # (incorporating PoCGatingMiddleware) on first dispatch — safe here: we run
+    # before serve_http (no real request yet) and resetting a None stack is a no-op.
+    app.middleware_stack = None
     app.add_middleware(PoCGatingMiddleware, gate=gate, blocked_prefixes=prefixes)
 
     # Register the startup-event hook AFTER the gate is attached. Here it is

@@ -141,6 +141,10 @@ def _install_build_app_warning_wrapper() -> None:
             # as the warning carrier here. ``PoCGate().is_active()`` is False
             # by construction so no real request is ever 503'd by this shim.
             sentinel_gate = PoCGate()
+            # Starlette 1.3.x finalizes the middleware stack during build_app;
+            # reset it so add_middleware rebuilds it on first dispatch (see
+            # api_router.build_gonka_app for the full rationale).
+            app.middleware_stack = None
             app.add_middleware(
                 PoCGatingMiddleware,
                 gate=sentinel_gate,

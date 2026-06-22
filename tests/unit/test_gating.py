@@ -371,3 +371,23 @@ def test_gate_presence_warning_silent_when_plugin_not_loaded(
         )
     finally:
         gonka_poc.PLUGIN_LOADED = original
+
+
+def test_build_gonka_app_survives_finalized_middleware_stack() -> None:
+    """Regression: Starlette 1.3.x (shipped with vLLM 0.23) finalizes the
+    middleware stack eagerly, so ``build_gonka_app``'s ``add_middleware()`` used
+    to raise ``RuntimeError: Cannot add middleware after an application has
+    started``. The fix resets ``app.middleware_stack`` before adding. CPU-only
+    (build_gonka_app does not import vllm at module scope)."""
+    from gonka_poc.entrypoint.api_router import build_gonka_app
+
+    app = FastAPI()
+    # Reproduce the post-build_app state: the middleware stack is already built.
+    app.middleware_stack = app.build_middleware_stack()
+
+    # Must NOT raise, and must actually install the gating middleware.
+    build_gonka_app(app, gate=PoCGate())
+
+    assert any(
+        m.cls is PoCGatingMiddleware for m in app.user_middleware
+    ), "PoCGatingMiddleware was not installed by build_gonka_app"
