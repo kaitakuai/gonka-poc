@@ -3,87 +3,91 @@
 The vLLM 0.23 lockable MoE ``WorkspaceManager`` sizes the MoE scratch from
 inference shapes and LOCKS it before the PoC forward runs; the PoC forward's
 larger shape would then raise "Workspace is locked". The fix unlocks the
-workspace around the forward and re-locks after.
+workspace around the forward (via the ``_compat`` shim) and re-locks after.
 
-These tests inject a fake ``vllm.v1.worker.workspace`` via ``sys.modules`` so
-they are CPU-only and need no real vllm (importing the extension module itself
-pulls only ``gonka_poc._compat``, which is light).
+CPU-only: we replace the version-dispatched ``_current()`` with a fake compat
+module exposing ``unlock_moe_workspace`` / ``lock_moe_workspace`` — no real
+vllm needed (importing the extension module pulls only the light ``_compat``).
 """
 from __future__ import annotations
 
-import sys
 import types
 
 import pytest
 
-from gonka_poc.worker.extension import unlocked_moe_workspace
+import gonka_poc.worker.extension as ext
 
 
-def _install_fake_vllm_workspace(monkeypatch, *, unlock, lock):
-    """Make ``from vllm.v1.worker.workspace import lock_workspace,
-    unlock_workspace`` resolve to the supplied callables (wins over a real vllm
-    install because ``sys.modules`` takes precedence)."""
-    for name in ("vllm", "vllm.v1", "vllm.v1.worker"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    ws = types.ModuleType("vllm.v1.worker.workspace")
-    ws.unlock_workspace = unlock
-    ws.lock_workspace = lock
-    monkeypatch.setitem(sys.modules, "vllm.v1.worker.workspace", ws)
+def _fake_compat(monkeypatch, *, unlock, lock):
+    compat = types.SimpleNamespace(
+        unlock_moe_workspace=unlock, lock_moe_workspace=lock
+    )
+    monkeypatch.setattr(ext, "_current", lambda: compat)
 
 
 def test_unlocks_then_relocks(monkeypatch):
     calls = []
-    _install_fake_vllm_workspace(
+    _fake_compat(
         monkeypatch,
-        unlock=lambda: calls.append("unlock"),
+        unlock=lambda: (calls.append("unlock"), True)[1],
         lock=lambda: calls.append("lock"),
     )
-    with unlocked_moe_workspace():
+    with ext.unlocked_moe_workspace():
         calls.append("forward")
     assert calls == ["unlock", "forward", "lock"]
 
 
 def test_relocks_even_when_body_raises(monkeypatch):
     calls = []
-    _install_fake_vllm_workspace(
+    _fake_compat(
         monkeypatch,
-        unlock=lambda: calls.append("unlock"),
+        unlock=lambda: (calls.append("unlock"), True)[1],
         lock=lambda: calls.append("lock"),
     )
     with pytest.raises(ValueError):
-        with unlocked_moe_workspace():
+        with ext.unlocked_moe_workspace():
             raise ValueError("boom")
-    # lock must still fire in the finally, and only after unlock
-    assert calls == ["unlock", "lock"]
+    assert calls == ["unlock", "lock"]  # re-locked in finally, after unlock
 
 
-def test_no_manager_is_a_noop(monkeypatch):
-    # current_workspace_manager() asserts when no MoE workspace exists, so
-    # unlock_workspace() raises — it must be swallowed and lock must NOT fire.
+def test_no_active_manager_is_a_noop(monkeypatch):
+    # unlock returns False (non-MoE model: current_workspace_manager() asserts) ->
+    # we must NOT call lock.
+    calls = []
+    _fake_compat(monkeypatch, unlock=lambda: False, lock=lambda: calls.append("lock"))
+    with ext.unlocked_moe_workspace():
+        calls.append("forward")
+    assert calls == ["forward"]
+
+
+def test_unlock_raising_is_swallowed(monkeypatch):
     calls = []
 
-    def _unlock_raises():
+    def _raises():
         raise AssertionError("workspace manager not initialized")
 
-    _install_fake_vllm_workspace(
-        monkeypatch, unlock=_unlock_raises, lock=lambda: calls.append("lock")
-    )
-    with unlocked_moe_workspace():
+    _fake_compat(monkeypatch, unlock=_raises, lock=lambda: calls.append("lock"))
+    with ext.unlocked_moe_workspace():
         calls.append("forward")
-    assert calls == ["forward"]  # unlock failed -> not unlocked -> no re-lock
+    assert calls == ["forward"]  # swallowed, body ran, no re-lock
 
 
-def test_vllm_below_0_23_is_a_noop(monkeypatch):
-    # Pre-0.23 has no lock/unlock symbols -> ImportError on the name import ->
-    # the manager is a no-op, the body still runs, nothing raises.
-    for name in ("vllm", "vllm.v1", "vllm.v1.worker"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.v1.worker.workspace",
-        types.ModuleType("vllm.v1.worker.workspace"),  # lacks lock/unlock attrs
-    )
+def test_compat_without_workspace_symbols_is_a_noop(monkeypatch):
+    # older shim / vLLM < 0.23: compat module lacks the functions -> no-op.
+    monkeypatch.setattr(ext, "_current", lambda: types.SimpleNamespace())
     ran = []
-    with unlocked_moe_workspace():
+    with ext.unlocked_moe_workspace():
+        ran.append("forward")
+    assert ran == ["forward"]
+
+
+def test_current_dispatch_failure_is_a_noop(monkeypatch):
+    # _current() itself failing (vllm unavailable / version unmapped) -> no-op.
+    def _boom():
+        raise RuntimeError("no vllm")
+
+    monkeypatch.setattr(ext, "_current", _boom)
+    ran = []
+    with ext.unlocked_moe_workspace():
         ran.append("forward")
     assert ran == ["forward"]

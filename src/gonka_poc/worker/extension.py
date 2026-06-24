@@ -74,25 +74,29 @@ def unlocked_moe_workspace():
     ``WorkspaceManager`` (ImportError); non-MoE models have no active manager
     (``current_workspace_manager()`` asserts) — both fall through cleanly.
     """
+    # Route the private ``vllm.v1.worker.workspace`` touchpoint through the
+    # version-dispatched compat shim (the only place allowed to reach into
+    # ``vllm.v1.*``). Older shims / non-0.23 vLLM simply lack these attributes.
     try:
-        from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
-    except ImportError:  # vLLM < 0.23 — no WorkspaceManager
-        lock_workspace = unlock_workspace = None  # type: ignore[assignment]
+        compat = _current()
+    except Exception:  # vLLM unavailable or version unmapped — nothing to do
+        compat = None
+    unlock = getattr(compat, "unlock_moe_workspace", None)
+    lock = getattr(compat, "lock_moe_workspace", None)
 
     unlocked = False
-    if unlock_workspace is not None:
+    if callable(unlock) and callable(lock):
         try:
-            unlock_workspace()
-            unlocked = True
-        except Exception:  # no MoE workspace manager (non-MoE model) — nothing to unlock
-            logger.debug("gonka_poc: no MoE workspace manager to unlock for the PoC forward")
+            unlocked = bool(unlock())
+        except Exception:  # defensive — never let workspace management crash PoC
+            logger.debug("gonka_poc: MoE workspace unlock unavailable for the PoC forward")
 
     try:
         yield
     finally:
         if unlocked:
             try:
-                lock_workspace()
+                lock()
             except Exception:  # leaving it unlocked is functionally safe (can still grow)
                 logger.warning(
                     "gonka_poc: failed to re-lock the MoE workspace after the PoC forward"
