@@ -51,6 +51,7 @@ def build_common_attention_metadata(
     seq_lens_cpu_upper_bound: Optional[Any] = None,
     _seq_lens_cpu: Optional[Any] = None,
     _num_computed_tokens_cpu: Optional[Any] = None,
+    positions: Optional[Any] = None,
 ) -> Any:
     """Construct a ``CommonAttentionMetadata`` for a PoC forward pass.
 
@@ -94,6 +95,7 @@ def build_common_attention_metadata(
     from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
     return CommonAttentionMetadata(
+        positions=positions,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens=seq_lens,

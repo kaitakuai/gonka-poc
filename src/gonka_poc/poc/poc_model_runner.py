@@ -79,83 +79,113 @@ def _ensure_layer_hooks(worker, block_hash, hidden_size):
     worker._poc_layer_hooks = hook
 
 
-def _get_block_size(worker):
-    """Get the KV cache block size from the worker config."""
-    return worker.cache_config.block_size
+def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions):
+    """Create attention metadata, built independently for every attention group.
 
+    Models may register KV cache groups with DIFFERENT block sizes (e.g.
+    DeepSeek-V4: sparse MLA and indexer use ``cache_config.block_size``,
+    the SWA compressor uses its own ``block_size`` — 8 at compress_ratio=128).
+    Sharing one slot_mapping / block_table built for the main group hands
+    out-of-range slot ids to the other pools: OOB writes cause an illegal
+    memory access on sm_90 and silent memory corruption elsewhere. The
+    layout is therefore computed per group from that group's
+    ``kv_cache_spec.block_size``. For single-group models this reduces to
+    exactly the previous behaviour.
 
-def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker):
-    """Create attention metadata for batch_size sequences.
-
-    Uses the worker's metadata builders to create the correct metadata
-    for whatever attention backend is configured (FlashAttention,
-    FlashInfer, etc.). All private-API touchpoints (CommonAttentionMetadata
-    constructor + per-layer builder iteration over
-    ``model_runner.attn_groups``) are routed through ``gonka_poc._compat``.
+    ``positions`` is the shared per-token position tensor (also passed to the
+    model forward); DeepSeek-V4's C128A metadata builder requires it, every
+    other v0.23 backend ignores ``cm.positions``.
     """
     compat = _current_compat()
-    blocks_per_seq = math.ceil(seq_len / block_size)
     total_tokens = batch_size * seq_len
 
-    # slot_mapping: each sequence gets its own block range
-    all_slots = []
-    for seq_idx in range(batch_size):
-        base_block = seq_idx * blocks_per_seq
-        for t in range(seq_len):
-            block_idx = base_block + t // block_size
-            all_slots.append(block_idx * block_size + t % block_size)
-    slot_mapping = torch.tensor(all_slots, dtype=torch.long, device=device)
-
-    # block_table: [batch_size, blocks_per_seq]
-    block_table = torch.arange(
-        batch_size * blocks_per_seq, dtype=torch.int32, device=device
-    ).view(batch_size, blocks_per_seq)
-
-    # query_start_loc: [0, seq_len, 2*seq_len, ..., batch_size*seq_len]
     query_start_loc_gpu = (
-        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * seq_len
-    )
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * seq_len)
     query_start_loc_cpu = (
-        torch.arange(batch_size + 1, dtype=torch.int32, device="cpu") * seq_len
-    )
+        torch.arange(batch_size + 1, dtype=torch.int32, device="cpu") * seq_len)
+    seq_lens_gpu = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+    seq_lens_cpu = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cpu")
+    num_computed_cpu = torch.zeros(batch_size, dtype=torch.int32, device="cpu")
 
-    seq_lens_gpu = torch.full(
-        (batch_size,), seq_len, dtype=torch.int32, device=device
-    )
-    seq_lens_cpu = torch.full(
-        (batch_size,), seq_len, dtype=torch.int32, device="cpu"
-    )
+    def _layout(g_block):
+        # slot = (seq_idx*blocks_per_seq + t//g_block)*g_block + t%g_block
+        #      = seq_idx*padded_len + t   (contiguous per sequence, padded to
+        # a block multiple), so the mapping vectorizes to two aranges.
+        blocks_per_seq = math.ceil(seq_len / g_block)
+        padded = blocks_per_seq * g_block
+        base = (torch.arange(batch_size, dtype=torch.long, device=device)
+                * padded).repeat_interleave(seq_len)
+        slot_mapping = base + torch.arange(
+            seq_len, dtype=torch.long, device=device).repeat(batch_size)
+        block_table = torch.arange(
+            batch_size * blocks_per_seq, dtype=torch.int32, device=device
+        ).view(batch_size, blocks_per_seq)
+        return slot_mapping, block_table
 
-    common_attn_metadata = compat.build_common_attention_metadata(
-        query_start_loc=query_start_loc_gpu,
-        query_start_loc_cpu=query_start_loc_cpu,
-        seq_lens=seq_lens_gpu,
-        num_reqs=batch_size,
-        num_actual_tokens=total_tokens,
-        max_query_len=seq_len,
-        max_seq_len=seq_len,
-        block_table_tensor=block_table,
-        slot_mapping=slot_mapping,
-        causal=True,
-        _seq_lens_cpu=seq_lens_cpu,
-        seq_lens_cpu_upper_bound=seq_lens_cpu,
-        _num_computed_tokens_cpu=torch.zeros(
-            batch_size, dtype=torch.int32, device="cpu"
-        ),
-    )
-
-    attn_metadata_dict, slot_mapping_dict = compat.build_attn_metadata_per_layer(
-        worker.model_runner,
-        common_attn_metadata,
-        slot_mapping=slot_mapping,
-    )
-
+    layouts = {}
+    attn_metadata_dict = {}
+    slot_mapping_dict = {}
+    for kv_group in worker.model_runner.attn_groups:
+        for attn_group in kv_group:
+            builder = attn_group.get_metadata_builder(0)
+            # Prefer the builder's spec: it reflects kernel_block_size splits
+            # (spec.copy_with_new_block_size) that the group spec does not.
+            spec = getattr(builder, "kv_cache_spec", None)
+            g_block = (getattr(spec, "block_size", None)
+                       or attn_group.kv_cache_spec.block_size)
+            if g_block not in layouts:
+                layouts[g_block] = _layout(g_block)
+            slot_mapping, block_table = layouts[g_block]
+            cm = compat.build_common_attention_metadata(
+                positions=positions,
+                query_start_loc=query_start_loc_gpu,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens_gpu,
+                num_reqs=batch_size,
+                num_actual_tokens=total_tokens,
+                max_query_len=seq_len,
+                max_seq_len=seq_len,
+                block_table_tensor=block_table,
+                slot_mapping=slot_mapping,
+                causal=True,
+                _seq_lens_cpu=seq_lens_cpu,
+                seq_lens_cpu_upper_bound=seq_lens_cpu,
+                _num_computed_tokens_cpu=num_computed_cpu,
+            )
+            metadata = builder.build(common_prefix_len=0, common_attn_metadata=cm)
+            for layer_name in attn_group.layer_names:
+                attn_metadata_dict[layer_name] = metadata
+                slot_mapping_dict[layer_name] = slot_mapping
     return attn_metadata_dict, slot_mapping_dict
 
 
-def _get_or_create_attn_metadata(batch_size, seq_len, block_size, device, worker):
-    """Create fresh attention metadata for the given parameters."""
-    return _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker)
+def _generate_poc_input_ids(block_hash, public_key, nonces, seq_len, worker, device):
+    """Deterministic pseudo token ids for token-id-dependent architectures.
+
+    DeepSeek-V4's hash-MoE layers route experts via ``tid2eid[input_ids]``
+    and hard-fail on ``input_ids=None``. PoC has no real tokens, so ids are
+    derived from the same ``(block_hash, public_key, nonce)`` seed scheme as
+    the input embeddings (``_input_ids`` suffix), through the same
+    framework-independent murmur3 pipeline as ``gpu_random`` — pure integer
+    arithmetic, stable across torch versions (a consensus requirement).
+    Gated by model_type so every other architecture keeps ``input_ids=None``.
+    """
+    hf_cfg = getattr(
+        getattr(worker.model_runner, "model_config", None), "hf_config", None)
+    if getattr(hf_cfg, "model_type", None) != "deepseek_v4":
+        return None
+    from .gpu_random import _seed_from_string, _batched_murmur3_32
+    vocab = int(hf_cfg.vocab_size)
+    batch_size = len(nonces)
+    keys = torch.arange(seq_len, dtype=torch.int32, device=device)
+    keys = keys.unsqueeze(0).expand(batch_size, -1)
+    seeds = torch.tensor(
+        [[_seed_from_string(f"{block_hash}_{public_key}_nonce{n}_input_ids")]
+         for n in nonces],
+        dtype=torch.int64, device=device)
+    # murmur3 yields uniform uint32; modulo bias at vocab << 2^32 is
+    # negligible for routing purposes.
+    return (_batched_murmur3_32(keys, seeds) % vocab).to(torch.int32).flatten()
 
 
 # NOTE(layer-1): revisit whether this KV-scratch reuse helper is still needed
@@ -241,14 +271,17 @@ def execute_poc_forward(
 
     _ensure_layer_hooks(worker, block_hash, hidden_size)
 
-    # Get block_size and prepare attention metadata (cached, reused)
-    block_size = _get_block_size(worker)
-    attn_metadata, slot_mapping_dict = _get_or_create_attn_metadata(
-        batch_size, seq_len, block_size, device, worker
+    # Per-token positions: shared by the model forward and (for architectures
+    # that need it, e.g. DeepSeek-V4 C128A) the attention metadata.
+    positions = torch.arange(
+        seq_len, dtype=torch.int64, device=device).repeat(batch_size)
+
+    attn_metadata, slot_mapping_dict = _create_v1_attn_metadata(
+        batch_size, seq_len, device, worker, positions
     )
 
-    # Positions for the batch
-    positions = torch.arange(seq_len, device=device).repeat(batch_size)
+    poc_input_ids = _generate_poc_input_ids(
+        block_hash, public_key, nonces, seq_len, worker, device)
 
     # Generate inputs for all nonces at once
     intermediate_tensors = None
@@ -302,7 +335,7 @@ def execute_poc_forward(
     ):
         with poc_forward_context():
             hidden_states = model(
-                input_ids=None,
+                input_ids=poc_input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
