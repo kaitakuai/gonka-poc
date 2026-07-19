@@ -124,3 +124,24 @@ def test_pseudo_ids_vary_by_nonce_and_namespace():
     alt_seed = _seed_from_string("bh_pk_nonce0")
     ids_seed = _seed_from_string("bh_pk_nonce0_input_ids")
     assert alt_seed != ids_seed
+
+
+def test_pseudo_ids_reference_vectors():
+    """Frozen reference vectors for the derivation convention (v1).
+
+    Mirrors docs/pseudo-input-ids-convention.md. An independent
+    implementation (in-band PoC line) must reproduce these before
+    DeepSeek-V4 network activation; any change to the derivation breaks
+    this test on purpose.
+    """
+    bh, pk, vocab = "poc_ids_convention_v1_block", "poc_ids_convention_v1_pubkey", 163840
+    assert _seed_from_string(f"{bh}_{pk}_nonce0_input_ids") == 2980507924
+    assert _seed_from_string(f"{bh}_{pk}_nonce1_input_ids") == 2917457512
+    expected0 = [119046, 160019, 98337, 39450, 94909, 163782, 59011, 57361,
+                 156377, 36469, 139643, 43988, 50299, 147011, 12130, 86013]
+    expected1 = [137719, 146475, 40370, 95731, 105609, 72910, 88608, 153625,
+                 112488, 156080, 83284, 17839, 70977, 48769, 15417, 65900]
+    assert _derive_ids(bh, pk, [0], 16, vocab).tolist() == expected0
+    assert _derive_ids(bh, pk, [1], 16, vocab).tolist() == expected1
+    ids256 = _derive_ids(bh, pk, [0], 256, vocab)
+    assert (int(ids256.sum()), int(ids256.min()), int(ids256.max())) == (20594062, 181, 163834)

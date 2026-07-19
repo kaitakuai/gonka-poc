@@ -39,7 +39,7 @@ from gonka_poc._compat import current  # noqa: E402 -- after importorskip
 # callable.
 _REQUIRED_ATTRS: tuple[str, ...] = (
     "build_common_attention_metadata",
-    "build_attn_metadata_per_layer",
+    "build_attn_metadata_per_group",
     "get_kv_cache_pool",
     "abort_all_requests",
 )

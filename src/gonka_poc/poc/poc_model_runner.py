@@ -11,8 +11,9 @@ compat shim. The import binds the resolver function and each consumer calls
 it to obtain the actual module: ``compat = _current_compat();
 compat.build_common_attention_metadata(...)``. Touchpoints:
     * ``CommonAttentionMetadata`` construction
-    * per-layer ``AttentionMetadata`` builder iteration over
-      ``model_runner.attn_groups``
+    * per-group ``AttentionMetadata`` construction (iteration over
+      ``model_runner.attn_groups``, per-group ``kv_cache_spec.block_size``
+      resolution, ``builder.build``) via ``build_attn_metadata_per_group``
     * ``model_runner.kv_caches`` access
 
 The following vLLM imports REMAIN at module scope because they are public
@@ -123,40 +124,35 @@ def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions):
         return slot_mapping, block_table
 
     layouts = {}
-    attn_metadata_dict = {}
-    slot_mapping_dict = {}
-    for kv_group in worker.model_runner.attn_groups:
-        for attn_group in kv_group:
-            builder = attn_group.get_metadata_builder(0)
-            # Prefer the builder's spec: it reflects kernel_block_size splits
-            # (spec.copy_with_new_block_size) that the group spec does not.
-            spec = getattr(builder, "kv_cache_spec", None)
-            g_block = (getattr(spec, "block_size", None)
-                       or attn_group.kv_cache_spec.block_size)
-            if g_block not in layouts:
-                layouts[g_block] = _layout(g_block)
-            slot_mapping, block_table = layouts[g_block]
-            cm = compat.build_common_attention_metadata(
-                positions=positions,
-                query_start_loc=query_start_loc_gpu,
-                query_start_loc_cpu=query_start_loc_cpu,
-                seq_lens=seq_lens_gpu,
-                num_reqs=batch_size,
-                num_actual_tokens=total_tokens,
-                max_query_len=seq_len,
-                max_seq_len=seq_len,
-                block_table_tensor=block_table,
-                slot_mapping=slot_mapping,
-                causal=True,
-                _seq_lens_cpu=seq_lens_cpu,
-                seq_lens_cpu_upper_bound=seq_lens_cpu,
-                _num_computed_tokens_cpu=num_computed_cpu,
-            )
-            metadata = builder.build(common_prefix_len=0, common_attn_metadata=cm)
-            for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name] = metadata
-                slot_mapping_dict[layer_name] = slot_mapping
-    return attn_metadata_dict, slot_mapping_dict
+
+    def _layout_for_block_size(g_block):
+        if g_block not in layouts:
+            layouts[g_block] = _layout(g_block)
+        return layouts[g_block]
+
+    def _common_metadata_for_layout(slot_mapping, block_table):
+        return compat.build_common_attention_metadata(
+            positions=positions,
+            query_start_loc=query_start_loc_gpu,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens_gpu,
+            num_reqs=batch_size,
+            num_actual_tokens=total_tokens,
+            max_query_len=seq_len,
+            max_seq_len=seq_len,
+            block_table_tensor=block_table,
+            slot_mapping=slot_mapping,
+            causal=True,
+            _seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu_upper_bound=seq_lens_cpu,
+            _num_computed_tokens_cpu=num_computed_cpu,
+        )
+
+    return compat.build_attn_metadata_per_group(
+        worker.model_runner,
+        layout_for_block_size=_layout_for_block_size,
+        common_metadata_for_layout=_common_metadata_for_layout,
+    )
 
 
 def _generate_poc_input_ids(block_hash, public_key, nonces, seq_len, worker, device):
