@@ -28,6 +28,7 @@ test stays green).
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -182,14 +183,9 @@ def build_attn_metadata_per_group(
             block_size = getattr(spec, "block_size", None)
             if block_size is None:
                 block_size = attn_group.kv_cache_spec.block_size
-            # Manager (pool-unit) block size of the group -- the kernel size
-            # above may be a split of it (kernel_block_size). The layout
-            # callable needs BOTH: kernel units for slot/table math, manager
-            # units to expand a borrowed pool-block lease (ratio r = m/g).
-            manager_block_size = getattr(
-                attn_group.kv_cache_spec, "block_size", None)
-            if manager_block_size is None:
-                manager_block_size = block_size
+            # kv_cache_spec.block_size = manager (pool-unit) size;
+            # block_size above may be its kernel split (r = m/g).
+            manager_block_size = attn_group.kv_cache_spec.block_size
             slot_mapping, block_table = layout_for_block_size(
                 block_size, manager_block_size)
             metadata = builder.build(
@@ -410,8 +406,6 @@ def install_engine_core_poc_methods() -> bool:
     if getattr(EngineCore, _ENGINE_CORE_BORROW_FLAG, False):
         return True
 
-    import math as _math
-
     def gonka_poc_borrow_blocks(self, num_nonces: int, seq_len: int):
         """Lease free KV blocks for a PoC validation forward.
 
@@ -425,7 +419,7 @@ def install_engine_core_poc_methods() -> bool:
             block_pool = kv_mgr.block_pool
             groups = kv_mgr.kv_cache_config.kv_cache_groups
             blocks_per_seq = max(
-                _math.ceil(int(seq_len) / int(g.kv_cache_spec.block_size))
+                math.ceil(int(seq_len) / int(g.kv_cache_spec.block_size))
                 for g in groups)
         except Exception as exc:
             logger.warning(
@@ -461,6 +455,16 @@ def install_engine_core_poc_methods() -> bool:
     return True
 
 
+def _utility_call(engine_client: Any):
+    """Resolve the UTILITY RPC callable or raise (feature-unavailable)."""
+    core = getattr(engine_client, "engine_core", None)
+    call = getattr(core, "call_utility_async", None)
+    if call is None:
+        raise RuntimeError(
+            "engine_core.call_utility_async unavailable on this EngineClient")
+    return call
+
+
 async def borrow_poc_blocks(
     engine_client: Any, num_nonces: int, seq_len: int,
 ) -> Optional[dict]:
@@ -474,24 +478,16 @@ async def borrow_poc_blocks(
 
     Version constraint: vllm == 0.25.*
     """
-    core = getattr(engine_client, "engine_core", None)
-    call = getattr(core, "call_utility_async", None)
-    if call is None:
-        raise RuntimeError(
-            "engine_core.call_utility_async unavailable on this EngineClient")
-    return await call("gonka_poc_borrow_blocks", int(num_nonces), int(seq_len))
+    return await _utility_call(engine_client)(
+        "gonka_poc_borrow_blocks", int(num_nonces), int(seq_len))
 
 
 async def return_poc_blocks(engine_client: Any, block_ids: list) -> None:
     """Frontend wrapper: return a previously leased KV block set."""
     if not block_ids:
         return
-    core = getattr(engine_client, "engine_core", None)
-    call = getattr(core, "call_utility_async", None)
-    if call is None:
-        raise RuntimeError(
-            "engine_core.call_utility_async unavailable on this EngineClient")
-    await call("gonka_poc_return_blocks", list(block_ids))
+    await _utility_call(engine_client)(
+        "gonka_poc_return_blocks", list(block_ids))
 
 
 __all__ = [

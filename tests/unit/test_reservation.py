@@ -37,16 +37,16 @@ class FakeCore:
 
 
 class FakeEngine:
-    def __init__(self, script, with_abort=True):
+    def __init__(self, script):
         self.engine_core = FakeCore(script)
         self.aborted = 0
         self.prefix_resets = 0
-        if with_abort:
-            # abort_all_requests enumerates output_processor.request_states
-            # and calls .abort(rid); give it one in-flight request.
-            class _OP:
-                request_states = {"req-1": object()}
-            self.output_processor = _OP()
+
+        # abort_all_requests enumerates output_processor.request_states
+        # and calls .abort(rid); give it one in-flight request.
+        class _OP:
+            request_states = {"req-1": object()}
+        self.output_processor = _OP()
 
     async def abort(self, request_id, **kwargs):
         self.aborted += 1
@@ -56,10 +56,6 @@ class FakeEngine:
 
 
 LEASE = {"block_ids": [7, 3, 12, 5], "blocks_per_seq": 2}
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def test_lease_yielded_and_returned():
@@ -73,7 +69,7 @@ def test_lease_yielded_and_returned():
             "gonka_poc_borrow_blocks", "gonka_poc_return_blocks"]
         assert eng.engine_core.calls[1][1] == (LEASE["block_ids"],)
 
-    _run(go())
+    asyncio.run(go())
     assert eng.aborted == 0
     assert eng.prefix_resets == 0
 
@@ -86,7 +82,7 @@ def test_blocks_returned_on_body_exception():
             async with reservation.poc_reservation(eng, 2, 32):
                 raise RuntimeError("boom")
 
-    _run(go())
+    asyncio.run(go())
     assert [m for m, _ in eng.engine_core.calls][-1] == "gonka_poc_return_blocks"
 
 
@@ -102,7 +98,7 @@ def test_pool_busy_escalates_through_abort_then_succeeds():
         async with reservation.poc_reservation(eng, 2, 32, timeout_ms=60) as lease:
             assert lease == LEASE
 
-    _run(go())
+    asyncio.run(go())
     assert eng.aborted == 1  # escalation drained the in-flight request
     assert eng.prefix_resets == 0
 
@@ -117,7 +113,7 @@ def test_rpc_broken_falls_back_with_abort_and_prefix_reset():
         async with reservation.poc_reservation(eng, 2, 32, timeout_ms=1) as lease:
             assert lease is None
 
-    _run(go())
+    asyncio.run(go())
     borrow_calls = [
         m for m, _ in eng.engine_core.calls if m == "gonka_poc_borrow_blocks"]
     assert len(borrow_calls) == 1  # broken RPC is not retried
@@ -138,5 +134,5 @@ def test_reservation_lock_serializes():
     async def go():
         await asyncio.gather(user("a", 0.05), user("b", 0))
 
-    _run(go())
+    asyncio.run(go())
     assert order == ["a-in", "a-out", "b-in", "b-out"]

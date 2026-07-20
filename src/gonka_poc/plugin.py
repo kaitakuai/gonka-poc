@@ -48,7 +48,8 @@ def register() -> None:
       3. Install the KV borrow/return UTILITY methods on
          ``vllm.v1.engine.core.EngineCore`` (via the version-dispatched
          compat shim). ``load_general_plugins()`` runs inside the
-         engine-core process (vllm/v1/engine/core.py:107-109), which is
+         engine-core process (pinned with version + contract test in the
+         shim's ``install_engine_core_poc_methods`` docstring), which is
          the only process that owns the BlockPool — class-level injection
          here is what makes ``call_utility_async("gonka_poc_borrow_blocks",
          ...)`` from the API server resolve. Harmless no-op in every other

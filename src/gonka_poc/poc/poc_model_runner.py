@@ -265,17 +265,6 @@ def _generate_poc_input_ids(block_hash, public_key, nonces, seq_len, worker, dev
     return (_batched_murmur3_32(keys, seeds) % vocab).to(torch.int32).flatten()
 
 
-# NOTE: the KV-scratch reuse path (_select_poc_kv_scratch — inputs_embeds
-# written in place into the front of a live KV tensor) was REMOVED with the
-# borrowed-blocks port: it saved almost no memory, clobbered inference KV
-# (the block-0 region) outside any lease, and silently ignored
-# poc_stronger_rng (always legacy per-nonce RNG, diverging from the fresh
-# path's concat-murmur when the flag is set). A fresh buffer produces
-# numerically identical vectors on the flag-off path (same
-# _seed_from_string/_normal pipeline). Upstream removed it the same way
-# (gonka-ai/vllm qd/combine-poc-and-inference, 590616ab0).
-
-
 @torch.inference_mode()
 def execute_poc_forward(
     worker,
@@ -363,10 +352,9 @@ def execute_poc_forward(
     inputs_embeds = None
 
     if pp_group.is_first_rank:
-        # Always a FRESH buffer — never a view into KV cache memory (the
-        # old scratch path wrote outside any lease; see the removal NOTE
-        # above execute_poc_forward). Numerics are unchanged: both RNG
-        # branches were already the source of truth for the fresh path.
+        # Always a FRESH buffer — the old KV-scratch reuse path wrote outside
+        # any lease and skewed poc_stronger_rng; removed, numerics unchanged
+        # (ADR-0015, Decision 5).
         _gen_fn = generate_inputs_concat_murmur if poc_stronger_rng else generate_inputs
         inputs_embeds = _gen_fn(
             block_hash, public_key, nonces,

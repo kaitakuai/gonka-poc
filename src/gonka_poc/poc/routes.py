@@ -648,19 +648,14 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     start_time = time.time()
     computed_artifacts = []
 
-    # One KV reservation per request, reused across chunks (chunks overwrite
-    # the same leased blocks — teacher-forced batches are independent).
-    # lease=None → the reservation layer already aborted inference; the
-    # chunks then run the legacy in-place layout.
+    # One lease per request, reused across chunks; lease=None ⇒ inference
+    # already aborted, legacy in-place layout — see poc_reservation.
     async with poc_reservation(
         engine_client, body.batch_size, body.params.seq_len,
     ) as lease:
         for i in range(0, total_nonces, body.batch_size):
             chunk = body.nonces[i:i + body.batch_size]
             chunk_idx = i // body.batch_size
-
-            def check_cancelled():
-                return False
 
             while _is_generation_active(app_id):
                 await asyncio.sleep(0.1)
@@ -669,7 +664,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 artifacts = await _compute_artifacts_chunk(
                     engine_client, chunk, body.block_hash, body.public_key,
                     body.params.seq_len, body.params.k_dim, body.poc_stronger_rng,
-                    POC_GENERATE_CHUNK_TIMEOUT_SEC, check_cancelled,
+                    POC_GENERATE_CHUNK_TIMEOUT_SEC, None,
                     lease=lease,
                 )
                 computed_artifacts.extend(artifacts)

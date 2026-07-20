@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from vllm.logger import init_logger
+from .reservation import poc_reservation
 from .validation import run_validation
 from .callbacks import get_callback_queue, clear_callback_queue
 from .data import DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
@@ -215,22 +216,15 @@ class GenerateQueue:
         start_time = time.time()
         computed_artifacts = []
 
-        # One KV reservation per job, reused across its chunks (chunks
-        # overwrite the same leased blocks — teacher-forced batches are
-        # independent). lease=None → the reservation layer already aborted
-        # inference and the chunks run the legacy in-place layout. The
-        # reservation lock also arbitrates with concurrent wait=True
-        # requests. Lazy import to avoid a circular import (routes.py
-        # imports GenerateJob/queue from this module).
-        from .reservation import poc_reservation
-
+        # One lease per job, reused across chunks; lease=None ⇒ inference
+        # already aborted, legacy in-place layout — see poc_reservation.
+        # The reservation lock also arbitrates with concurrent wait=True requests.
         async with poc_reservation(
             job.engine_client, job.batch_size, job.seq_len,
         ) as lease:
             for i in range(0, total_nonces, job.batch_size):
                 chunk = job.nonces[i:i + job.batch_size]
                 chunk_idx = i // job.batch_size
-                chunk_start_time = time.time()
 
                 while True:
                     if self._stop_event.is_set():
@@ -241,6 +235,8 @@ class GenerateQueue:
                         continue
 
                     try:
+                        # Lazy import: routes.py imports GenerateJob/queue
+                        # from this module.
                         from .routes import _execute_poc_forward_rpc
                         result = await asyncio.wait_for(
                             _execute_poc_forward_rpc(

@@ -87,7 +87,7 @@ def test_distinct_ids_no_slot_collisions():
 
 
 def test_guard_non_divisible_split():
-    with pytest.raises(ValueError, match="not a\n?.*multiple|not a"):
+    with pytest.raises(ValueError, match="not a multiple"):
         _borrowed_layout(1, 16, 6, 16, [1, 2, 3], 3, device="cpu")
 
 

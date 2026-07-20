@@ -1,19 +1,13 @@
 """KV block reservation for PoC validation — inference keeps running.
 
-Port of gonka-ai/vllm branch ``qd/combine-poc-and-inference`` (commits
-052648bf4, 590616ab0, 32fda8c4f, cbe5380fc) into the plugin architecture:
-the in-tree AsyncLLM monkey-patch became compat-shim RPC wrappers plus
-class-level EngineCore method injection
-(:func:`gonka_poc._compat.install_engine_core_poc_methods`).
+Port of gonka-ai/vllm branch ``qd/combine-poc-and-inference`` into the
+plugin architecture — commits, design, and rationale in ADR-0015.
 
-Multi-group design ("shared lease"):
-    vLLM keeps ONE block pool per engine; the block-id namespace is shared
-    by every kv-cache group (per-group state is only the block tables), so
-    a single lease of ``num_nonces * max_g ceil(seq_len/block_size_g)``
-    pool blocks reserves those blocks' byte ranges in EVERY group's
-    tensors at once. The engine core computes the stripe (it alone knows
-    the per-group block sizes); the worker expands pool ids per group by
-    the kernel-split ratio — see ``poc_model_runner._borrowed_layout``.
+Multi-group ("shared lease"): the block-id namespace is pool-global, so one
+lease of ``num_nonces * max_g ceil(seq_len/block_size_g)`` blocks reserves
+every group's tensors at once; the engine core sizes the stripe, the worker
+expands ids per group (ADR-0015 Decisions 1-3,
+``poc_model_runner._borrowed_layout``).
 
 Safety contract:
     * Borrowed path: the only KV bytes the PoC forward writes belong to
