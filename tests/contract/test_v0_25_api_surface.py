@@ -1,9 +1,9 @@
-"""Drift detector: pin the vLLM 0.23 private surfaces the plugin depends on.
+"""Drift detector: pin the vLLM 0.25 private surfaces the plugin depends on.
 
 Each test asserts a precise upstream symbol exists with the expected shape
 (class name, dataclass field set, method signature, attribute presence).
 Run on every CI bump of the vllm pin -- a failure here means the compat
-shim ``gonka_poc._compat.v0_23`` needs an update before the plugin can
+shim ``gonka_poc._compat.v0_25`` needs an update before the plugin can
 target a new vllm minor.
 
 Scope: read-only inspection of vllm modules; NO GPU, NO engine startup, NO
@@ -16,15 +16,14 @@ import inspect
 
 import pytest
 
-# Module-level gate: this file pins the 0.23.x surface. Against any other
+# Module-level gate: this file pins the 0.25.x surface. Against any other
 # installed vllm minor the pins are EXPECTED to differ -- skip wholesale so
-# the suite is runnable in both 0.23 and 0.25 environments (the 0.25 pins
-# live in test_v0_25_api_surface.py).
+# the suite is runnable in both 0.23 and 0.25 environments.
 _vllm = pytest.importorskip("vllm")
-if not getattr(_vllm, "__version__", "").startswith("0.23."):
+if not getattr(_vllm, "__version__", "").startswith("0.25."):
     pytest.skip(
         f"vllm {getattr(_vllm, '__version__', '?')} installed; this contract "
-        "file pins 0.23.x",
+        "file pins 0.25.x (see test_v0_23_api_surface.py for 0.23.x)",
         allow_module_level=True,
     )
 
@@ -37,8 +36,8 @@ def test_vllm_version_pin() -> None:
     """We claim 0.23.x in pyproject.toml; assert the installed wheel matches."""
     vllm = pytest.importorskip("vllm")
     version = getattr(vllm, "__version__", "")
-    assert version.startswith("0.23."), (
-        f"gonka-poc compat shim targets vllm 0.23.*, got {version!r}. "
+    assert version.startswith("0.25."), (
+        f"gonka-poc compat shim targets vllm 0.25.*, got {version!r}. "
         "Add a new compat module under gonka_poc/_compat/ and update _DISPATCH."
     )
 
@@ -55,11 +54,12 @@ def test_common_attention_metadata_fields() -> None:
     fields the plugin relies on so a future minor bump fails loudly.
     """
     pytest.importorskip("vllm")
-    mod = importlib.import_module("vllm.v1.attention.backends.utils")
+    mod = importlib.import_module("vllm.v1.attention.backend")
     cls = getattr(mod, "CommonAttentionMetadata", None)
     assert cls is not None, (
         "CommonAttentionMetadata not found at "
-        "vllm.v1.attention.backends.utils -- compat shim needs update."
+        "vllm.v1.attention.backend (v0.25 canonical declaration site) "
+        "-- compat shim needs update."
     )
 
     # If it's a dataclass / NamedTuple, inspect __annotations__; otherwise
@@ -80,12 +80,16 @@ def test_common_attention_metadata_fields() -> None:
         # this assertion fails on a future minor, the compat shim's
         # build_common_attention_metadata kwarg list must change.
         "seq_lens_cpu_upper_bound",
+        # positions: optional field the v0_25 shim passes through; read by the
+        # DeepSeek-V4 C128A sparse-MLA builder + SWA compressor. A future
+        # minor dropping/renaming it = fleet-wide TypeError at cm construction.
+        "positions",
     }
     missing = required_fields - set(annotations)
     assert not missing, (
         f"CommonAttentionMetadata is missing fields {sorted(missing)}; "
         f"present fields = {sorted(annotations)}. "
-        f"Update gonka_poc._compat.v0_23.build_common_attention_metadata."
+        f"Update gonka_poc._compat.v0_25.build_common_attention_metadata."
     )
 
 
@@ -110,7 +114,7 @@ def test_kv_caches_attribute() -> None:
     src = inspect.getsource(cls)
     assert has_class_annotation or "kv_caches" in src, (
         "GPUModelRunner.kv_caches not visible in v0.23 source -- "
-        "gonka_poc._compat.v0_23.get_kv_cache_pool needs revision."
+        "gonka_poc._compat.v0_25.get_kv_cache_pool needs revision."
     )
 
 
@@ -391,7 +395,7 @@ def test_distributed_groups_present() -> None:
         fn = getattr(mod, name, None)
         assert fn is not None and callable(fn), (
             f"vllm.distributed.{name} missing or non-callable -- "
-            f"gonka_poc._compat.v0_23 must reroute via "
+            f"gonka_poc._compat.v0_25 must reroute via "
             f"vllm.distributed.parallel_state."
         )
         # Both are zero-arg getters returning a GroupCoordinator. If a
@@ -689,6 +693,6 @@ def test_compat_current_returns_module() -> None:
         assert callable(attr), (
             f"compat module missing callable {symbol!r}; "
             f"present attrs = {sorted(a for a in dir(mod) if not a.startswith('_'))!r}. "
-            f"Either gonka_poc._compat.v0_23 dropped the export or _DISPATCH "
+            f"Either gonka_poc._compat.v0_25 dropped the export or _DISPATCH "
             f"is pointing at the wrong module."
         )

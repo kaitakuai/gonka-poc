@@ -171,7 +171,12 @@ async def _run_server(args: Any) -> None:
     except Exception:  # pragma: no cover - vllm internal layout drift
         get_uvicorn_log_config = None  # type: ignore[assignment]
 
-    listen_address, sock = setup_server(args)
+    # vLLM 0.25 made ``reuse_port`` a required keyword on setup_server();
+    # 0.23 rejects the kwarg. Try the 0.25 signature first, fall back to 0.23.
+    try:
+        listen_address, sock = setup_server(args, reuse_port=False)
+    except TypeError:
+        listen_address, sock = setup_server(args)
 
     async with build_async_engine_client(args) as engine_client:
         supported_tasks = await engine_client.get_supported_tasks()
