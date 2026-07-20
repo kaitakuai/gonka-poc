@@ -80,6 +80,12 @@ def test_common_attention_metadata_fields() -> None:
         # this assertion fails on a future minor, the compat shim's
         # build_common_attention_metadata kwarg list must change.
         "seq_lens_cpu_upper_bound",
+        # positions is passed unconditionally for EVERY model since the
+        # DeepSeek-V4 port (its C128A sparse-MLA builder requires it; all
+        # other v0.23 backends ignore it). If a future minor drops or
+        # renames the field, cm construction would raise fleet-wide -- this
+        # pin turns that into a loud contract failure instead.
+        "positions",
     }
     missing = required_fields - set(annotations)
     assert not missing, (
@@ -681,7 +687,7 @@ def test_compat_current_returns_module() -> None:
 
     for symbol in (
         "build_common_attention_metadata",
-        "build_attn_metadata_per_layer",
+        "build_attn_metadata_per_group",
         "get_kv_cache_pool",
         "abort_all_requests",
     ):
