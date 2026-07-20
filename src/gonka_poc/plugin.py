@@ -45,6 +45,14 @@ def register() -> None:
          ``vllm.entrypoints.openai.api_server.build_app`` so the same
          gate-presence check fires for both ``vllm serve`` and our own
          ``gonka-vllm-serve`` path.
+      3. Install the KV borrow/return UTILITY methods on
+         ``vllm.v1.engine.core.EngineCore`` (via the version-dispatched
+         compat shim). ``load_general_plugins()`` runs inside the
+         engine-core process (vllm/v1/engine/core.py:107-109), which is
+         the only process that owns the BlockPool — class-level injection
+         here is what makes ``call_utility_async("gonka_poc_borrow_blocks",
+         ...)`` from the API server resolve. Harmless no-op in every other
+         process.
 
     NOTE: we do NOT install the worker extension here -- that lives behind
     the ``--worker-extension-cls gonka_poc.worker.PoCWorkerExtension`` CLI
@@ -69,6 +77,17 @@ def register() -> None:
         logger.exception(
             "gonka_poc.plugin.register: build_app warning wrapper install failed"
         )
+
+    try:
+        from gonka_poc._compat import current as _compat_current
+
+        _compat_current().install_engine_core_poc_methods()
+    except Exception as exc:
+        # Unsupported vllm minor / import quirk: validation degrades to the
+        # legacy abort-based path, never a crash at plugin load.
+        logger.debug(
+            "gonka_poc.plugin.register: EngineCore borrow install skipped: %s",
+            exc)
 
     _registered = True
 

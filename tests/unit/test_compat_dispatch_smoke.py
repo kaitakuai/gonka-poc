@@ -42,6 +42,9 @@ _REQUIRED_ATTRS: tuple[str, ...] = (
     "build_attn_metadata_per_group",
     "get_kv_cache_pool",
     "abort_all_requests",
+    "install_engine_core_poc_methods",
+    "borrow_poc_blocks",
+    "return_poc_blocks",
 )
 
 _OPTIONAL_ATTRS: tuple[str, ...] = (

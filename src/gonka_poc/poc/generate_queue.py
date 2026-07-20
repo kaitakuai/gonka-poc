@@ -214,46 +214,57 @@ class GenerateQueue:
         
         start_time = time.time()
         computed_artifacts = []
-        
-        for i in range(0, total_nonces, job.batch_size):
-            chunk = job.nonces[i:i + job.batch_size]
-            chunk_idx = i // job.batch_size
-            chunk_start_time = time.time()
-            
-            while True:
-                if self._stop_event.is_set():
-                    raise RuntimeError("Job cancelled")
-                
-                if self._is_generation_active and self._is_generation_active(job.app_id):
-                    await asyncio.sleep(0.1)
-                    continue
-                
-                try:
-                    # Lazy import to avoid circular import (routes.py imports
-                    # GenerateJob/queue from this module).
-                    from .routes import _execute_poc_forward_rpc
-                    result = await asyncio.wait_for(
-                        _execute_poc_forward_rpc(
-                            job.engine_client,
-                            nonces=chunk,
-                            block_hash=job.block_hash,
-                            public_key=job.public_key,
-                            seq_len=job.seq_len,
-                            k_dim=job.k_dim,
-                            poc_stronger_rng=job.poc_stronger_rng,
-                            timeout_ms=int(POC_GENERATE_CHUNK_TIMEOUT_SEC * 1000),
-                        ),
-                        timeout=POC_GENERATE_CHUNK_TIMEOUT_SEC
-                    )
-                except asyncio.CancelledError:
-                    logger.info(f"PoC queue job {job.request_id[:8]}: cancelled during RPC")
-                    raise RuntimeError("Job cancelled")
-                except asyncio.TimeoutError:
-                    raise RuntimeError(f"Timeout waiting for engine RPC: chunk {chunk_idx}")
 
-                computed_artifacts.extend(result.get("artifacts", []))
-                logger.debug(f"PoC queue job {job.request_id[:8]}: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
-                break
+        # One KV reservation per job, reused across its chunks (chunks
+        # overwrite the same leased blocks — teacher-forced batches are
+        # independent). lease=None → the reservation layer already aborted
+        # inference and the chunks run the legacy in-place layout. The
+        # reservation lock also arbitrates with concurrent wait=True
+        # requests. Lazy import to avoid a circular import (routes.py
+        # imports GenerateJob/queue from this module).
+        from .reservation import poc_reservation
+
+        async with poc_reservation(
+            job.engine_client, job.batch_size, job.seq_len,
+        ) as lease:
+            for i in range(0, total_nonces, job.batch_size):
+                chunk = job.nonces[i:i + job.batch_size]
+                chunk_idx = i // job.batch_size
+                chunk_start_time = time.time()
+
+                while True:
+                    if self._stop_event.is_set():
+                        raise RuntimeError("Job cancelled")
+
+                    if self._is_generation_active and self._is_generation_active(job.app_id):
+                        await asyncio.sleep(0.1)
+                        continue
+
+                    try:
+                        from .routes import _execute_poc_forward_rpc
+                        result = await asyncio.wait_for(
+                            _execute_poc_forward_rpc(
+                                job.engine_client,
+                                nonces=chunk,
+                                block_hash=job.block_hash,
+                                public_key=job.public_key,
+                                seq_len=job.seq_len,
+                                k_dim=job.k_dim,
+                                poc_stronger_rng=job.poc_stronger_rng,
+                                timeout_ms=int(POC_GENERATE_CHUNK_TIMEOUT_SEC * 1000),
+                                lease=lease,
+                            ),
+                            timeout=POC_GENERATE_CHUNK_TIMEOUT_SEC
+                        )
+                    except asyncio.CancelledError:
+                        logger.info(f"PoC queue job {job.request_id[:8]}: cancelled during RPC")
+                        raise RuntimeError("Job cancelled")
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(f"Timeout waiting for engine RPC: chunk {chunk_idx}")
+
+                    computed_artifacts.extend(result.get("artifacts", []))
+                    logger.debug(f"PoC queue job {job.request_id[:8]}: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
+                    break
         
         elapsed = time.time() - start_time
         rate = total_nonces / elapsed if elapsed > 0 else 0

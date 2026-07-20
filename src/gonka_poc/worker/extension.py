@@ -123,6 +123,8 @@ class PoCWorkerExtension:
         hidden_size: Optional[int] = None,
         k_dim: int = 12,
         poc_stronger_rng: bool = False,
+        borrowed_block_ids: Optional[List[int]] = None,
+        borrowed_stripe: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Execute one PoC forward pass on this worker rank.
 
@@ -137,6 +139,10 @@ class PoCWorkerExtension:
             k_dim: artifact vector dimensionality (default 12).
             poc_stronger_rng: if True, use murmur-concat RNG path; default
                 False (legacy seeded normal path).
+            borrowed_block_ids / borrowed_stripe: KV block lease from
+                ``gonka_poc_borrow_blocks`` (validation-without-abort path).
+                ``None`` = legacy in-place layout over blocks 0..N. Physical
+                block choice does not affect artifact values (address-only).
 
         Returns:
             ``{"artifacts": [{"nonce": int, "vector_b64": str}, ...],
@@ -184,6 +190,12 @@ class PoCWorkerExtension:
                 int(hidden_size),
                 k_dim=int(k_dim) if k_dim is not None else DEFAULT_K_DIM,
                 poc_stronger_rng=bool(poc_stronger_rng),
+                borrowed_block_ids=(
+                    list(borrowed_block_ids)
+                    if borrowed_block_ids is not None else None),
+                borrowed_stripe=(
+                    int(borrowed_stripe)
+                    if borrowed_stripe is not None else None),
             )
 
         rank = int(getattr(self, "rank", -1))

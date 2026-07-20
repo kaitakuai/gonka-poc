@@ -15,6 +15,7 @@ from .config import PoCState
 from .data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
 from .callbacks import CallbackSender
 from .generate_queue import GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES
+from .reservation import poc_reservation, reset_prefix_cache_after_inplace_poc
 from .validation import run_validation
 
 logger = init_logger(__name__)
@@ -40,8 +41,15 @@ async def _execute_poc_forward_rpc(
     k_dim: int,
     poc_stronger_rng: bool = False,
     timeout_ms: int = POC_RPC_TIMEOUT_MS,
+    lease: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run ``execute_poc_forward`` on every worker rank and aggregate.
+
+    ``lease`` is a KV block lease from :func:`poc_reservation`
+    (``{"block_ids": [...], "blocks_per_seq": int}``) — when present the
+    forward writes ONLY leased blocks and live inference stays intact;
+    ``None`` selects the legacy in-place layout (blocks 0..N — callers must
+    have aborted inference first).
 
     Uses ``EngineClient.collective_rpc`` (vllm/engine/protocol.py) to invoke
     :meth:`gonka_poc.worker.PoCWorkerExtension.execute_poc_forward` on each
@@ -71,6 +79,10 @@ async def _execute_poc_forward_rpc(
             "seq_len": int(seq_len),
             "k_dim": int(k_dim),
             "poc_stronger_rng": bool(poc_stronger_rng),
+            "borrowed_block_ids": (
+                list(lease["block_ids"]) if lease else None),
+            "borrowed_stripe": (
+                int(lease["blocks_per_seq"]) if lease else None),
         },
     )
 
@@ -306,12 +318,14 @@ async def _compute_artifacts_chunk(
     poc_stronger_rng: bool = False,
     timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
     check_cancelled: Optional[callable] = None,
+    lease: Optional[Dict[str, Any]] = None,
 ) -> List[Dict]:
     """Compute artifacts for a chunk via collective_rpc.
 
-    There is no longer a "skipped" backoff path: PoCGatingMiddleware blocks
-    new inference admission while PoC is active, so the GPU is exclusively
-    ours by the time we reach this call.
+    There is no longer a "skipped" backoff path: with a ``lease`` the
+    forward runs on KV blocks disjoint from live inference, and on the
+    legacy fallback (``lease is None``) the reservation layer has already
+    aborted in-flight inference.
     """
     if check_cancelled and check_cancelled():
         raise RuntimeError("Cancelled")
@@ -325,6 +339,7 @@ async def _compute_artifacts_chunk(
         k_dim=k_dim,
         poc_stronger_rng=poc_stronger_rng,
         timeout_ms=int(timeout_sec * 1000),
+        lease=lease,
     )
     return result.get("artifacts", [])
 
@@ -408,6 +423,11 @@ async def _generation_loop(
     except Exception as e:
         logger.error(f"PoC generation crashed: {e}", exc_info=True)
         raise
+    finally:
+        # Mining wrote blocks 0..N in place without evicting their cached
+        # hashes — drop the prefix cache so later hits cannot serve
+        # PoC-clobbered KV (best-effort; see reservation module docstring).
+        await reset_prefix_cache_after_inplace_poc(engine_client)
 
 
 # =============================================================================
@@ -620,34 +640,42 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     
     while _is_generation_active(app_id):
         await asyncio.sleep(0.1)
-    
+
     total_nonces = len(body.nonces)
     n_chunks = (total_nonces + body.batch_size - 1) // body.batch_size
     logger.info(f"PoC /generate: {total_nonces} nonces, batch_size={body.batch_size}, chunks={n_chunks}")
-    
+
     start_time = time.time()
     computed_artifacts = []
-    
-    for i in range(0, total_nonces, body.batch_size):
-        chunk = body.nonces[i:i + body.batch_size]
-        chunk_idx = i // body.batch_size
-        
-        def check_cancelled():
-            return False
-        
-        while _is_generation_active(app_id):
-            await asyncio.sleep(0.1)
-        
-        try:
-            artifacts = await _compute_artifacts_chunk(
-                engine_client, chunk, body.block_hash, body.public_key,
-                body.params.seq_len, body.params.k_dim, body.poc_stronger_rng,
-                POC_GENERATE_CHUNK_TIMEOUT_SEC, check_cancelled
-            )
-            computed_artifacts.extend(artifacts)
-            logger.debug(f"PoC /generate: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
-        except RuntimeError as e:
-            raise HTTPException(status_code=503, detail=str(e))
+
+    # One KV reservation per request, reused across chunks (chunks overwrite
+    # the same leased blocks — teacher-forced batches are independent).
+    # lease=None → the reservation layer already aborted inference; the
+    # chunks then run the legacy in-place layout.
+    async with poc_reservation(
+        engine_client, body.batch_size, body.params.seq_len,
+    ) as lease:
+        for i in range(0, total_nonces, body.batch_size):
+            chunk = body.nonces[i:i + body.batch_size]
+            chunk_idx = i // body.batch_size
+
+            def check_cancelled():
+                return False
+
+            while _is_generation_active(app_id):
+                await asyncio.sleep(0.1)
+
+            try:
+                artifacts = await _compute_artifacts_chunk(
+                    engine_client, chunk, body.block_hash, body.public_key,
+                    body.params.seq_len, body.params.k_dim, body.poc_stronger_rng,
+                    POC_GENERATE_CHUNK_TIMEOUT_SEC, check_cancelled,
+                    lease=lease,
+                )
+                computed_artifacts.extend(artifacts)
+                logger.debug(f"PoC /generate: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
+            except RuntimeError as e:
+                raise HTTPException(status_code=503, detail=str(e))
     
     elapsed = time.time() - start_time
     rate = total_nonces / elapsed if elapsed > 0 else 0
@@ -693,6 +721,27 @@ async def get_generate_result(request: Request, request_id: str) -> dict:
         response["error"] = record.error
     
     return response
+
+
+@router.get("/versions")
+async def get_versions() -> dict:
+    """Feature-detection handshake for the network node.
+
+    ``poc_validation_inference: true`` advertises that ``/generate``
+    validation runs on leased KV blocks concurrently with live inference
+    (port of gonka-ai/vllm qd/combine-poc-and-inference).
+    """
+    from vllm import __version__ as vllm_version
+    try:
+        import importlib.metadata as _md
+        gonka_poc_version = _md.version("gonka-poc")
+    except Exception:
+        gonka_poc_version = "unknown"
+    return {
+        "vllm_version": vllm_version,
+        "gonka_poc_version": gonka_poc_version,
+        "poc_validation_inference": True,
+    }
 
 
 @router.get("/status")

@@ -80,7 +80,72 @@ def _ensure_layer_hooks(worker, block_hash, hidden_size):
     worker._poc_layer_hooks = hook
 
 
-def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions):
+def _borrowed_layout(
+    batch_size: int,
+    seq_len: int,
+    g_block: int,
+    m_block: int,
+    borrowed_block_ids: List[int],
+    stripe: int,
+    device,
+):
+    """slot_mapping + block_table over a LEASED set of pool blocks.
+
+    ``borrowed_block_ids`` are pool-unit (manager) block ids leased from the
+    ONE engine-wide BlockPool; ``stripe`` is the per-sequence allotment
+    (``max_g ceil(seq_len/manager_block_size_g)`` — computed by the engine
+    core with full group knowledge). Sequence ``i`` uses the first
+    ``ceil(seq_len/m_block)`` ids of its stripe
+    ``borrowed_block_ids[i*stripe : (i+1)*stripe]``.
+
+    Unit conversion: slot/table math runs in KERNEL units (``g_block`` from
+    ``builder.kv_cache_spec`` — possibly a kernel split of the manager
+    size). A pool block ``b`` covers kernel blocks ``b*r .. b*r+r-1``
+    (``r = m_block//g_block``), i.e. the contiguous slot range
+    ``[b*m_block, (b+1)*m_block)`` — so the slot for token ``t`` of
+    sequence ``i`` is ``L[i][t//m_block]*m_block + t%m_block``, and the
+    kernel block table entry ``k`` is ``L[i][k//r]*r + k%r``. Using a raw
+    pool id as a kernel id WITHOUT the ×r expansion would address bytes
+    inside pool block ``id//r`` — unleased, possibly live inference KV.
+
+    Fail-loud guards (ValueError → RPC error → the chunk fails visibly,
+    never a silent mis-write): non-divisible split, stripe too small,
+    lease too small.
+    """
+    if m_block % g_block != 0:
+        raise ValueError(
+            f"PoC borrowed layout: manager block {m_block} is not a "
+            f"multiple of kernel block {g_block}")
+    r = m_block // g_block
+    bps = math.ceil(seq_len / m_block)
+    if bps > stripe:
+        raise ValueError(
+            f"PoC lease stripe {stripe} too small: group with manager "
+            f"block {m_block} needs {bps} blocks/seq at seq_len {seq_len}")
+    if batch_size * stripe > len(borrowed_block_ids):
+        raise ValueError(
+            f"PoC lease has {len(borrowed_block_ids)} blocks, needs "
+            f"{batch_size * stripe} ({batch_size} seqs × stripe {stripe})")
+
+    ids = torch.tensor(
+        borrowed_block_ids[:batch_size * stripe],
+        dtype=torch.long, device=device).view(batch_size, stripe)
+    seq_blocks = ids[:, :bps]  # [batch, bps] pool-unit ids
+
+    j = torch.arange(seq_len, dtype=torch.long, device=device) // m_block
+    off = torch.arange(seq_len, dtype=torch.long, device=device) % m_block
+    slot_mapping = (seq_blocks[:, j] * m_block + off).reshape(-1)
+
+    kernel_ids = (
+        seq_blocks.unsqueeze(-1) * r
+        + torch.arange(r, dtype=torch.long, device=device)
+    ).view(batch_size, bps * r)
+    block_table = kernel_ids.to(torch.int32)
+    return slot_mapping, block_table
+
+
+def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions,
+                             borrowed_block_ids=None, borrowed_stripe=None):
     """Create attention metadata, built independently for every attention group.
 
     Models may register KV cache groups with DIFFERENT block sizes (e.g.
@@ -92,6 +157,16 @@ def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions):
     layout is therefore computed per group from that group's
     ``kv_cache_spec.block_size``. For single-group models this reduces to
     exactly the previous behaviour.
+
+    Two block sources:
+      * ``borrowed_block_ids is None`` — legacy in-place layout over blocks
+        ``0..N`` (mining and the abort-based fallback). BIT-PATH UNCHANGED.
+      * lease (``borrowed_block_ids`` + ``borrowed_stripe`` from
+        ``gonka_poc_borrow_blocks``) — validation runs on pool blocks that
+        are provably disjoint from live inference; see
+        :func:`_borrowed_layout`. Physical block ids enter ONLY the address
+        translation (scatter targets / gather tables), never the attention
+        math, so artifacts are bit-identical across block choices.
 
     ``positions`` is the shared per-token position tensor (also passed to the
     model forward); DeepSeek-V4's C128A metadata builder requires it, every
@@ -108,7 +183,12 @@ def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions):
     seq_lens_cpu = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cpu")
     num_computed_cpu = torch.zeros(batch_size, dtype=torch.int32, device="cpu")
 
-    def _layout(g_block):
+    def _layout(g_block, m_block):
+        if borrowed_block_ids is not None:
+            return _borrowed_layout(
+                batch_size, seq_len, g_block, m_block,
+                borrowed_block_ids, int(borrowed_stripe or 0), device)
+        # Legacy in-place layout:
         # slot = (seq_idx*blocks_per_seq + t//g_block)*g_block + t%g_block
         #      = seq_idx*padded_len + t   (contiguous per sequence, padded to
         # a block multiple), so the mapping vectorizes to two aranges.
@@ -125,10 +205,11 @@ def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions):
 
     layouts = {}
 
-    def _layout_for_block_size(g_block):
-        if g_block not in layouts:
-            layouts[g_block] = _layout(g_block)
-        return layouts[g_block]
+    def _layout_for_block_size(g_block, m_block):
+        key = (g_block, m_block)
+        if key not in layouts:
+            layouts[key] = _layout(g_block, m_block)
+        return layouts[key]
 
     def _common_metadata_for_layout(slot_mapping, block_table):
         return compat.build_common_attention_metadata(
@@ -184,33 +265,15 @@ def _generate_poc_input_ids(block_hash, public_key, nonces, seq_len, worker, dev
     return (_batched_murmur3_32(keys, seeds) % vocab).to(torch.int32).flatten()
 
 
-# NOTE(layer-1): revisit whether this KV-scratch reuse helper is still needed
-# once the layer-1 port stabilises; the v0.23 backends may handle scratch
-# allocation differently from the v0.15 fork this was lifted from.
-def _select_poc_kv_scratch(
-    kv_caches: list,
-    dtype: torch.dtype,
-    needed_elems: int,
-    batch_size: int,
-    seq_len: int,
-    hidden_size: int,
-) -> Optional[torch.Tensor]:
-    """Return a no-copy scratch view into KV cache memory, if safe.
-
-    KV cache storage may use packed dtypes (e.g. ``uint8`` for FP8) or
-    backend-specific non-contiguous layouts. Only reuse memory that already
-    matches model embedding dtype and is contiguous so ``view(-1)`` does not
-    allocate a copy.
-    """
-    for kv in kv_caches:
-        if kv.dtype != dtype:
-            continue
-        if not kv.is_contiguous():
-            continue
-        if kv.numel() < needed_elems:
-            continue
-        return kv.view(-1)[:needed_elems].view(batch_size, seq_len, hidden_size)
-    return None
+# NOTE: the KV-scratch reuse path (_select_poc_kv_scratch — inputs_embeds
+# written in place into the front of a live KV tensor) was REMOVED with the
+# borrowed-blocks port: it saved almost no memory, clobbered inference KV
+# (the block-0 region) outside any lease, and silently ignored
+# poc_stronger_rng (always legacy per-nonce RNG, diverging from the fresh
+# path's concat-murmur when the flag is set). A fresh buffer produces
+# numerically identical vectors on the flag-off path (same
+# _seed_from_string/_normal pipeline). Upstream removed it the same way
+# (gonka-ai/vllm qd/combine-poc-and-inference, 590616ab0).
 
 
 @torch.inference_mode()
@@ -223,6 +286,8 @@ def execute_poc_forward(
     hidden_size: int,
     k_dim: int = DEFAULT_K_DIM,
     poc_stronger_rng: bool = False,
+    borrowed_block_ids: Optional[List[int]] = None,
+    borrowed_stripe: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Execute batched PoC forward pass on a V1 worker.
 
@@ -248,6 +313,12 @@ def execute_poc_forward(
                 "nonces": nonces,
                 "k_dim": k_dim,
                 "poc_stronger_rng": poc_stronger_rng,
+                # Lease travels in the broadcast so every TP rank builds the
+                # SAME layout even if collective_rpc arg delivery ever skews
+                # (belt-and-braces, mirrors the upstream port).
+                "has_borrowed": borrowed_block_ids is not None,
+                "borrowed_block_ids": borrowed_block_ids or [],
+                "borrowed_stripe": int(borrowed_stripe or 0),
             }, src=0)
         else:
             broadcast_data = broadcast_tensor_dict(src=0)
@@ -257,6 +328,12 @@ def execute_poc_forward(
             k_dim = int(broadcast_data["k_dim"])
             batch_size = len(nonces)
             poc_stronger_rng = bool(broadcast_data["poc_stronger_rng"])
+            if broadcast_data.get("has_borrowed"):
+                borrowed_block_ids = list(broadcast_data["borrowed_block_ids"])
+                borrowed_stripe = int(broadcast_data["borrowed_stripe"])
+            else:
+                borrowed_block_ids = None
+                borrowed_stripe = None
 
     pp_group = get_pp_group()
 
@@ -273,7 +350,9 @@ def execute_poc_forward(
         seq_len, dtype=torch.int64, device=device).repeat(batch_size)
 
     attn_metadata, slot_mapping_dict = _create_v1_attn_metadata(
-        batch_size, seq_len, device, worker, positions
+        batch_size, seq_len, device, worker, positions,
+        borrowed_block_ids=borrowed_block_ids,
+        borrowed_stripe=borrowed_stripe,
     )
 
     poc_input_ids = _generate_poc_input_ids(
@@ -284,40 +363,16 @@ def execute_poc_forward(
     inputs_embeds = None
 
     if pp_group.is_first_rank:
-        # Route through the compat shim instead of raw getattr so future
-        # vLLM minors that rename ``model_runner.kv_caches`` can be
-        # adapted in one place (gonka_poc._compat.v0_23.get_kv_cache_pool).
-        # The shim raises if kv_caches isn't populated -- worker
-        # initialise_kv_caches() must run before any PoC forward, so a
-        # missing pool here is a real bug, not a silent fall-through.
-        # Note: get_kv_cache_pool can raise if the worker has not yet
-        # initialised the KV pool; in that case fall back to the generated
-        # inputs path (same effect as the previous empty-list default).
-        compat = _current_compat()
-        try:
-            kv_caches = compat.get_kv_cache_pool(worker.model_runner)
-        except RuntimeError:
-            kv_caches = []
-        needed_elems = batch_size * seq_len * hidden_size
-        kv_scratch = _select_poc_kv_scratch(
-            kv_caches, dtype, needed_elems, batch_size, seq_len, hidden_size,
+        # Always a FRESH buffer — never a view into KV cache memory (the
+        # old scratch path wrote outside any lease; see the removal NOTE
+        # above execute_poc_forward). Numerics are unchanged: both RNG
+        # branches were already the source of truth for the fresh path.
+        _gen_fn = generate_inputs_concat_murmur if poc_stronger_rng else generate_inputs
+        inputs_embeds = _gen_fn(
+            block_hash, public_key, nonces,
+            dim=hidden_size, seq_len=seq_len,
+            device=device, dtype=dtype,
         )
-        if kv_scratch is not None:
-            from .gpu_random import _seed_from_string, _normal
-            for i, nonce in enumerate(nonces):
-                seed = _seed_from_string(
-                    f"{block_hash}_{public_key}_nonce{nonce}")
-                vals = _normal(seed, seq_len * hidden_size, device)
-                kv_scratch[i].copy_(vals.view(seq_len, hidden_size).to(dtype))
-                del vals
-            inputs_embeds = kv_scratch
-        else:
-            _gen_fn = generate_inputs_concat_murmur if poc_stronger_rng else generate_inputs
-            inputs_embeds = _gen_fn(
-                block_hash, public_key, nonces,
-                dim=hidden_size, seq_len=seq_len,
-                device=device, dtype=dtype,
-            )
     else:
         intermediate_tensors = IntermediateTensors(
             pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
