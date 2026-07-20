@@ -774,3 +774,26 @@ def test_kv_block_pool_borrow_surface() -> None:
     assert callable(getattr(AsyncLLM, "reset_prefix_cache", None)), (
         "AsyncLLM.reset_prefix_cache gone — in-place PoC rounds would leave "
         "poisoned prefix-cache entries with no way to drop them")
+    assert "reset_running_requests" in inspect.signature(
+        AsyncLLM.reset_prefix_cache).parameters, (
+        "reset_prefix_cache lost the reset_running_requests kwarg — the "
+        "reservation layer escalates through it when the plain reset "
+        "returns False (blocks still held)")
+
+    # Semantic pins the lease design DEPENDS on (not just symbol presence):
+    # (a) leasing must evict cached hashes, else a leased block can still be
+    #     served from the prefix cache after PoC overwrote it;
+    assert "_maybe_evict_cached_block" in inspect.getsource(
+        BlockPool.get_new_blocks), (
+        "get_new_blocks no longer evicts cached hashes — the 'lease is "
+        "disjoint from the prefix cache' premise fails; re-verify the "
+        "borrow design before trusting leased PoC forwards")
+    # (b) the borrow/return methods read b.block_id / b.is_null and index
+    #     pool.blocks[bid] — pin the field names.
+    KVCacheBlock = importlib.import_module(
+        "vllm.v1.core.kv_cache_utils").KVCacheBlock
+    for field in ("block_id", "is_null"):
+        assert hasattr(KVCacheBlock, field) or field in getattr(
+            KVCacheBlock, "__dataclass_fields__", {}), (
+            f"KVCacheBlock.{field} renamed — gonka_poc_borrow_blocks/"
+            "return_blocks read it")

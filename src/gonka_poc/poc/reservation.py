@@ -34,6 +34,7 @@ import asyncio
 import logging
 import os
 import time
+import weakref
 from contextlib import asynccontextmanager
 from typing import Any, Optional, Tuple
 
@@ -50,6 +51,57 @@ _ABORT_SETTLE_SEC = 0.05
 
 # FIFO per-process lock — see module docstring.
 _poc_reservation_lock = asyncio.Lock()
+
+# Lazily-cached borrow availability per engine client. Weakly keyed so a
+# dead client cannot alias a new object at the same address.
+_borrow_available: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+async def poc_validation_available(engine_client: Any) -> bool:
+    """Probe (once per engine client) whether borrowed-lease validation is on.
+
+    Three gates, all required:
+      * every worker rank reports ``scratch_capable=False`` — on
+        scratch-capable (bf16-KV) configs the fleet's artifacts depend on
+        the legacy KV-scratch bit-path, and a leased forward would change
+        bits (ADR-0015, Decision 5);
+      * the borrow RPC surface answers (a zero-block borrow returns None
+        without raising — proves the injected EngineCore methods and the
+        utility transport);
+      * not DP>1 (the compat wrapper refuses — the internal LB fans the
+        utility to every engine and returns only engine-0's lease).
+
+    Probe failures report False (validation degrades to the abort-based
+    legacy path); the result is cached for the engine client's lifetime.
+    """
+    try:
+        cached = _borrow_available.get(engine_client)
+    except TypeError:  # non-weakref-able client
+        cached = None
+    if cached is not None:
+        return cached
+    compat = _current_compat()
+    available = False
+    try:
+        ranks = await engine_client.collective_rpc(
+            "execute_poc_borrow_compat", timeout=30)
+        scratch_capable = any(
+            (r or {}).get("scratch_capable", True) for r in ranks)
+        if not scratch_capable:
+            # Zero-block borrow: exercises the full RPC path; returns None
+            # (needed <= 0) iff the surface is present and reachable.
+            await compat.borrow_poc_blocks(engine_client, 0, 1)
+            available = True
+    except Exception as exc:
+        logger.warning(
+            "PoC borrow availability probe failed — validation will use the "
+            "legacy abort-based path: %s", exc)
+    try:
+        _borrow_available[engine_client] = available
+    except TypeError:
+        pass
+    logger.info("PoC borrowed-lease validation available: %s", available)
+    return available
 
 
 async def _borrow_with_retry(
@@ -143,21 +195,43 @@ async def poc_reservation(
     legacy path the prefix cache is reset instead (see module docstring).
     """
     async with _poc_reservation_lock:
-        lease = await reserve_poc_blocks(
-            engine_client, num_nonces, seq_len, timeout_ms)
+        if await poc_validation_available(engine_client):
+            lease = await reserve_poc_blocks(
+                engine_client, num_nonces, seq_len, timeout_ms)
+        else:
+            # Legacy path from the start: abort once here; the per-chunk
+            # re-abort in _execute_poc_forward_rpc keeps later admissions
+            # out of the clobber range.
+            lease = None
+            try:
+                await _current_compat().abort_all_requests(engine_client)
+            except Exception as exc:
+                logger.error("PoC legacy-path abort failed: %s", exc)
         try:
             yield lease
         finally:
             if lease is not None:
-                try:
-                    await _current_compat().return_poc_blocks(
-                        engine_client, lease["block_ids"])
-                except Exception as exc:
-                    logger.error(
-                        "PoC failed to return %d leased KV blocks: %s",
-                        len(lease["block_ids"]), exc)
+                await _return_lease_with_retry(engine_client, lease)
             else:
                 await reset_prefix_cache_after_inplace_poc(engine_client)
+
+
+async def _return_lease_with_retry(engine_client: Any, lease: dict) -> None:
+    """Return leased blocks; a lost return shrinks the pool until restart,
+    so retry transient RPC failures a few times before giving up loudly."""
+    block_ids = lease["block_ids"]
+    for attempt in range(3):
+        try:
+            await _current_compat().return_poc_blocks(engine_client, block_ids)
+            return
+        except Exception as exc:
+            logger.warning(
+                "PoC lease return attempt %d/3 failed: %s", attempt + 1, exc)
+            await asyncio.sleep(0.2 * (attempt + 1))
+    logger.error(
+        "PoC LEAKED %d leased KV blocks (return failed 3x) — pool stays "
+        "smaller and prefix-cache resets will fail until engine restart",
+        len(block_ids))
 
 
 async def reset_prefix_cache_after_inplace_poc(engine_client: Any) -> None:
@@ -175,8 +249,29 @@ async def reset_prefix_cache_after_inplace_poc(engine_client: Any) -> None:
             "engine client lacks reset_prefix_cache — prefix cache may hold "
             "PoC-clobbered blocks after an in-place PoC round")
         return
+    # BlockPool.reset_prefix_cache returns False (dropping NO hashes) unless
+    # every block is free — a plain call can silently no-op while blocks are
+    # held (e.g. an outstanding lease or live requests). Escalate once with
+    # reset_running_requests=True (preempts running requests so they recompute
+    # their KV) and report failure truthfully.
     try:
-        await reset()
-        logger.info("prefix cache reset after in-place PoC round")
+        ok = await reset()
     except Exception as exc:
+        ok = False
         logger.warning("reset_prefix_cache failed: %s", exc)
+    if ok is False:
+        try:
+            ok = await reset(reset_running_requests=True)
+        except TypeError:
+            pass  # older signature without the kwarg
+        except Exception as exc:
+            logger.warning(
+                "reset_prefix_cache(reset_running_requests=True) failed: %s",
+                exc)
+    if ok is False:
+        logger.error(
+            "prefix cache NOT reset after in-place PoC round (blocks still "
+            "held) — cached hashes of clobbered blocks survive; prefix hits "
+            "may serve PoC garbage until a later successful reset")
+    else:
+        logger.info("prefix cache reset after in-place PoC round")

@@ -217,6 +217,31 @@ class PoCWorkerExtension:
 
         return {"artifacts": artifacts, "rank": rank}
 
+    def execute_poc_borrow_compat(self) -> Dict[str, Any]:
+        """Report whether borrowed-lease validation is bit-safe on this rank.
+
+        Borrowing is only safe where the legacy KV-scratch embeds path can
+        NEVER fire: on scratch-capable configs (a KV tensor matching the
+        model dtype and contiguous — bf16-KV models) the fleet's artifacts
+        depend on the scratch's deterministic self-overwrite, and a fresh
+        buffer + leased blocks would change bits (ADR-0015, Decision 5).
+        Conservative: ignores the size criterion, so a config that would
+        only sometimes select scratch still reports scratch_capable=True.
+        """
+        from gonka_poc._compat import current as _compat_current
+
+        try:
+            kv_caches = _compat_current().get_kv_cache_pool(self.model_runner)
+            dtype = self.model_config.dtype
+        except Exception:
+            # No pool yet / unexpected shape: report NOT borrow-safe.
+            return {"scratch_capable": True,
+                    "rank": int(getattr(self, "rank", -1))}
+        scratch_capable = any(
+            kv.dtype == dtype and kv.is_contiguous() for kv in kv_caches)
+        return {"scratch_capable": bool(scratch_capable),
+                "rank": int(getattr(self, "rank", -1))}
+
     # ------------------------------------------------------------------ #
     # Diagnostic / liveness pings (cheap, no GPU)
     # ------------------------------------------------------------------ #

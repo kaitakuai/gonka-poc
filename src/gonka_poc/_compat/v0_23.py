@@ -476,6 +476,16 @@ async def borrow_poc_blocks(
 
     Version constraint: vllm == 0.23.*
     """
+    parallel = getattr(
+        getattr(engine_client, "vllm_config", None), "parallel_config", None)
+    if parallel is not None and getattr(parallel, "data_parallel_size", 1) > 1:
+        # The DP internal-LB client fans call_utility_async to EVERY engine
+        # and returns only engine-0's result: each other engine would leak a
+        # lease, and the paired return would free foreign ids on their pools
+        # (assert-crash or cross-request corruption). Refuse -> callers fall
+        # back to the abort-based legacy path.
+        raise RuntimeError(
+            "KV borrow is unsupported with data_parallel_size > 1")
     return await _utility_call(engine_client)(
         "gonka_poc_borrow_blocks", int(num_nonces), int(seq_len))
 

@@ -34,26 +34,45 @@ from the BlockPool so validation and inference coexist; mining
    artifacts stay bit-identical across block choices (prover and validator
    always hold different blocks).
 4. **Reservation CM** (`poc_reservation`): per-process FIFO lock ×
-   reserve → forwards → return; escalation aborts inference once and
-   re-borrows; final fallback = legacy in-place layout **with inference
-   aborted first** (restores the missing safety invariant) and a
-   `reset_prefix_cache()` on exit (in-place rounds clobber cached blocks
-   without evicting their hashes). Mining also resets the prefix cache
-   when its loop ends.
-5. **KV-scratch embeds reuse removed** (upstream removed it the same way):
-   it wrote outside any lease and silently ignored `poc_stronger_rng`.
-   Fresh-buffer vectors are numerically identical on the flag-off path.
-6. **Feature detection:** `GET /api/v1/pow/versions` advertises
-   `poc_validation_inference: true`; engines without the injected methods
-   degrade to the abort-based path automatically.
+   reserve → forwards → return (return retried ×3; a lost return is logged
+   as a LEAK — pool shrinks until engine restart); escalation aborts
+   inference once and re-borrows. Legacy fallback = in-place layout with
+   inference aborted first AND **re-aborted before every chunk** (donor
+   behaviour — nothing gates admissions on the validation path, so
+   requests admitted between chunks would be silently clobbered). After
+   any in-place round (fallback or mining) the prefix cache is reset;
+   the reset's return value is CHECKED — `False` escalates once through
+   `reset_running_requests=True` and then logs an ERROR (a plain reset
+   silently refuses while any block is held).
+5. **KV-scratch embeds reuse is KEPT on the lease-None path, bit-exact**
+   — including its `poc_stronger_rng` skew. On scratch-capable configs
+   (KV dtype == model dtype, contiguous — bf16-KV models) the fleet's
+   artifacts depend on the scratch's deterministic layer-0
+   K/V-over-residual overwrite; changing it would break consensus under
+   every deployed validator. The borrowed path always uses a fresh buffer
+   and is therefore **only enabled where the scratch can never fire**:
+   the worker probe `execute_poc_borrow_compat` reports
+   `scratch_capable`, and `poc_validation_available` disables borrowing
+   on such configs (fp8/packed-KV models — GLM, DeepSeek-V4 — are
+   scratch-free and keep full bit-compat on both paths).
+6. **Feature detection:** `GET /api/v1/pow/versions` reports
+   `poc_validation_inference` from an actual probe (worker
+   scratch-capability + a zero-block borrow round-trip), never a literal.
+   Engines without the injected methods, scratch-capable configs, and
+   `data_parallel_size > 1` (the compat wrapper refuses — the DP internal
+   LB fans the utility RPC to every engine and would leak/corrupt
+   leases) all degrade to the abort-based path automatically.
 
 ## Consequences
 
-- Validation no longer stalls or corrupts inference; mining priority and
-  its bit-path are untouched (legacy layout unchanged byte-for-byte).
+- Validation no longer stalls or corrupts inference on borrow-enabled
+  configs; mining priority and its bit-path are untouched on ALL configs
+  (legacy layout + scratch unchanged byte-for-byte).
 - Known limits: the reservation lock is per API-server process
-  (`--api-server-count > 1` → bound degrades to P×); DP>1 engine cores are
-  out of scope; during a legacy-fallback validation new admissions are not
-  gated (rare: pool must stay exhausted even after an abort).
+  (`--api-server-count > 1` → bound degrades to P×); a mining round that
+  starts mid-validation pins the lease + lock until it ends (donor
+  behaviour; disconnected wait=true clients are not cancelled); a return
+  that fails 3× leaks the lease until engine restart (engine-side
+  owner-tag/TTL is future work).
 - Hardware A/B (two different leases → bit-compare artifacts) belongs in
   the V4 experiment programme before production trust.

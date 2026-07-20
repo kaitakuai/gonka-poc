@@ -15,7 +15,11 @@ from .config import PoCState
 from .data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
 from .callbacks import CallbackSender
 from .generate_queue import GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES
-from .reservation import poc_reservation, reset_prefix_cache_after_inplace_poc
+from .reservation import (
+    poc_reservation,
+    poc_validation_available,
+    reset_prefix_cache_after_inplace_poc,
+)
 from .validation import run_validation
 
 logger = init_logger(__name__)
@@ -67,6 +71,18 @@ async def _execute_poc_forward_rpc(
     """
     if not nonces:
         return {"artifacts": []}
+
+    if lease is None:
+        # In-place layout writes blocks 0..N unconditionally, and nothing
+        # gates new admissions on the validation path — re-drain in-flight
+        # inference before EVERY legacy chunk (upstream donor behaviour;
+        # requests admitted between chunks would otherwise be silently
+        # clobbered). During mining the gate keeps the in-flight set empty,
+        # so this is a cheap no-op there.
+        try:
+            await _current().abort_all_requests(engine_client)
+        except Exception as exc:
+            logger.warning("PoC pre-chunk abort failed: %s", exc)
 
     timeout_sec = timeout_ms / 1000.0
     results = await engine_client.collective_rpc(
@@ -719,12 +735,14 @@ async def get_generate_result(request: Request, request_id: str) -> dict:
 
 
 @router.get("/versions")
-async def get_versions() -> dict:
+async def get_versions(request: Request) -> dict:
     """Feature-detection handshake for the network node.
 
-    ``poc_validation_inference: true`` advertises that ``/generate``
-    validation runs on leased KV blocks concurrently with live inference
-    (port of gonka-ai/vllm qd/combine-poc-and-inference).
+    ``poc_validation_inference`` advertises that ``/generate`` validation
+    runs on leased KV blocks concurrently with live inference (port of
+    gonka-ai/vllm qd/combine-poc-and-inference). It reflects an actual
+    probe (borrow RPC reachable AND the config is not scratch-capable) —
+    never a hardcoded literal.
     """
     from vllm import __version__ as vllm_version
     try:
@@ -732,10 +750,12 @@ async def get_versions() -> dict:
         gonka_poc_version = _md.version("gonka-poc")
     except Exception:
         gonka_poc_version = "unknown"
+    engine_client = await get_engine_client(request)
     return {
         "vllm_version": vllm_version,
         "gonka_poc_version": gonka_poc_version,
-        "poc_validation_inference": True,
+        "poc_validation_inference":
+            await poc_validation_available(engine_client),
     }
 
 
