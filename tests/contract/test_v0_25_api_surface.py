@@ -685,7 +685,7 @@ def test_compat_current_returns_module() -> None:
 
     for symbol in (
         "build_common_attention_metadata",
-        "build_attn_metadata_per_layer",
+        "build_attn_metadata_per_group",
         "get_kv_cache_pool",
         "abort_all_requests",
     ):

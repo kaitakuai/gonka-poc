@@ -114,23 +114,39 @@ def build_common_attention_metadata(
 
 
 # ---------------------------------------------------------------------------- #
-# Per-layer AttentionMetadata expansion (model_runner.attn_groups iteration)
+# Per-group AttentionMetadata expansion (model_runner.attn_groups iteration)
 # ---------------------------------------------------------------------------- #
 
-def build_attn_metadata_per_layer(
+def build_attn_metadata_per_group(
     model_runner: Any,
-    common_attn_metadata: Any,
     *,
-    slot_mapping: Any,
+    layout_for_block_size: Any,
+    common_metadata_for_layout: Any,
 ) -> tuple[dict, dict]:
-    """Expand ``CommonAttentionMetadata`` into per-layer ``AttentionMetadata``.
+    """Build per-layer ``AttentionMetadata``, one build per attention group.
 
-    Upstream symbol: ``GPUModelRunner.attn_groups`` (list[list[AttentionGroup]])
-        declared at vllm/v1/worker/gpu_model_runner.py:555 (v0.25.1). Each
-        ``AttentionGroup`` exposes ``get_metadata_builder(index)`` and a
-        ``layer_names`` iterable; the builder's ``build(common_prefix_len,
-        common_attn_metadata)`` is the v1 entry point for materialising
-        backend-specific metadata (FlashAttention / FlashInfer / MLA).
+    Models may register KV cache groups with DIFFERENT block sizes (e.g.
+    DeepSeek-V4: sparse MLA / indexer at ``cache_config.block_size``, the SWA
+    compressor at 8). Each group's metadata must therefore be built from a
+    layout computed for THAT group's block size — sharing one layout hands
+    out-of-range slot ids to the other pools (OOB writes: illegal memory
+    access on sm_90, silent corruption elsewhere). For single-group models
+    the loop reproduces the historical single-layout behaviour exactly.
+
+    Upstream symbols (all version-pinned here, callers stay generic):
+        * ``GPUModelRunner.attn_groups`` (list[list[AttentionGroup]]),
+          vllm/v1/worker/gpu_model_runner.py:555 (v0.25.1)
+        * ``AttentionGroup.get_metadata_builder(index)`` and
+          ``AttentionGroup.layer_names`` / ``.kv_cache_spec``
+          (vllm/v1/worker/utils.py:223)
+        * ``builder.kv_cache_spec`` (vllm/v1/attention/backend.py:620) —
+          preferred block-size source because it reflects
+          ``kernel_block_size`` splits (``KVCacheSpec.copy_with_new_block_size``,
+          applied in ``AttentionGroup.get_metadata_builder``); the group spec
+          is the fallback. A literal 0 is treated as present (explicit
+          ``is None`` checks), even though no current spec produces it.
+        * ``builder.build(common_prefix_len, common_attn_metadata)`` — the v1
+          entry point for materialising backend-specific metadata.
 
     Version constraint: vllm == 0.25.*
 
@@ -141,19 +157,17 @@ def build_attn_metadata_per_layer(
 
     Args:
         model_runner: live ``GPUModelRunner`` instance from the worker.
-        common_attn_metadata: result of :func:`build_common_attention_metadata`.
-        slot_mapping: GPU tensor; mirrored per layer in the returned
-            ``slot_mapping_dict`` because ``set_forward_context`` wants a dict
-            keyed by layer name.
+        layout_for_block_size: callable ``(block_size:int) ->
+            (slot_mapping, block_table)``; the caller owns the tensor math
+            and may cache per block size.
+        common_metadata_for_layout: callable ``(slot_mapping, block_table) ->
+            CommonAttentionMetadata`` (normally a partial application of
+            :func:`build_common_attention_metadata`).
 
     Returns:
-        ``(attn_metadata_dict, slot_mapping_dict)`` where both are
-        ``dict[layer_name -> tensor/metadata]``. Pass straight into
-        ``set_forward_context(attn_metadata=..., slot_mapping=...)``.
-
-    Source of the iteration: fork branch ``mb/feat/port-pocv2-vllm-0.23.0``,
-    ``vllm/poc/poc_model_runner.py:118-133``. The body is copied verbatim --
-    only the GPU tensor construction (above) is the caller's responsibility.
+        ``(attn_metadata_dict, slot_mapping_dict)`` — both keyed by layer
+        name; the slot mapping for each layer is its group's. Pass straight
+        into ``set_forward_context(attn_metadata=..., slot_mapping=...)``.
     """
     attn_metadata_dict: dict = {}
     slot_mapping_dict: dict = {}
@@ -161,9 +175,16 @@ def build_attn_metadata_per_layer(
     for kv_cache_group_attn_groups in model_runner.attn_groups:
         for attn_group in kv_cache_group_attn_groups:
             builder = attn_group.get_metadata_builder(0)
+            spec = getattr(builder, "kv_cache_spec", None)
+            block_size = getattr(spec, "block_size", None)
+            if block_size is None:
+                block_size = attn_group.kv_cache_spec.block_size
+            slot_mapping, block_table = layout_for_block_size(block_size)
             metadata = builder.build(
                 common_prefix_len=0,
-                common_attn_metadata=common_attn_metadata,
+                common_attn_metadata=common_metadata_for_layout(
+                    slot_mapping, block_table
+                ),
             )
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = metadata
@@ -327,7 +348,7 @@ def lock_moe_workspace() -> None:
 
 __all__ = [
     "build_common_attention_metadata",
-    "build_attn_metadata_per_layer",
+    "build_attn_metadata_per_group",
     "get_kv_cache_pool",
     "abort_all_requests",
     "unlock_moe_workspace",
