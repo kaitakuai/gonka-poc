@@ -123,6 +123,8 @@ class PoCWorkerExtension:
         hidden_size: Optional[int] = None,
         k_dim: int = 12,
         poc_stronger_rng: bool = False,
+        borrowed_block_ids: Optional[List[int]] = None,
+        borrowed_stripe: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Execute one PoC forward pass on this worker rank.
 
@@ -137,6 +139,10 @@ class PoCWorkerExtension:
             k_dim: artifact vector dimensionality (default 12).
             poc_stronger_rng: if True, use murmur-concat RNG path; default
                 False (legacy seeded normal path).
+            borrowed_block_ids / borrowed_stripe: KV block lease from
+                ``gonka_poc_borrow_blocks`` (validation-without-abort path).
+                ``None`` = legacy in-place layout over blocks 0..N. Physical
+                block choice does not affect artifact values (address-only).
 
         Returns:
             ``{"artifacts": [{"nonce": int, "vector_b64": str}, ...],
@@ -184,6 +190,12 @@ class PoCWorkerExtension:
                 int(hidden_size),
                 k_dim=int(k_dim) if k_dim is not None else DEFAULT_K_DIM,
                 poc_stronger_rng=bool(poc_stronger_rng),
+                borrowed_block_ids=(
+                    list(borrowed_block_ids)
+                    if borrowed_block_ids is not None else None),
+                borrowed_stripe=(
+                    int(borrowed_stripe)
+                    if borrowed_stripe is not None else None),
             )
 
         rank = int(getattr(self, "rank", -1))
@@ -204,6 +216,31 @@ class PoCWorkerExtension:
                 })
 
         return {"artifacts": artifacts, "rank": rank}
+
+    def execute_poc_borrow_compat(self) -> Dict[str, Any]:
+        """Report whether borrowed-lease validation is bit-safe on this rank.
+
+        Borrowing is only safe where the legacy KV-scratch embeds path can
+        NEVER fire: on scratch-capable configs (a KV tensor matching the
+        model dtype and contiguous — bf16-KV models) the fleet's artifacts
+        depend on the scratch's deterministic self-overwrite, and a fresh
+        buffer + leased blocks would change bits (ADR-0015, Decision 5).
+        Conservative: ignores the size criterion, so a config that would
+        only sometimes select scratch still reports scratch_capable=True.
+        """
+        from gonka_poc._compat import current as _compat_current
+
+        try:
+            kv_caches = _compat_current().get_kv_cache_pool(self.model_runner)
+            dtype = self.model_config.dtype
+        except Exception:
+            # No pool yet / unexpected shape: report NOT borrow-safe.
+            return {"scratch_capable": True,
+                    "rank": int(getattr(self, "rank", -1))}
+        scratch_capable = any(
+            kv.dtype == dtype and kv.is_contiguous() for kv in kv_caches)
+        return {"scratch_capable": bool(scratch_capable),
+                "rank": int(getattr(self, "rank", -1))}
 
     # ------------------------------------------------------------------ #
     # Diagnostic / liveness pings (cheap, no GPU)

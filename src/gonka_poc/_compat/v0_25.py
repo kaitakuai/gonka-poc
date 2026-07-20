@@ -28,6 +28,7 @@ test stays green).
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -157,9 +158,12 @@ def build_attn_metadata_per_group(
 
     Args:
         model_runner: live ``GPUModelRunner`` instance from the worker.
-        layout_for_block_size: callable ``(block_size:int) ->
-            (slot_mapping, block_table)``; the caller owns the tensor math
-            and may cache per block size.
+        layout_for_block_size: callable ``(block_size:int,
+            manager_block_size:int) -> (slot_mapping, block_table)``; the
+            caller owns the tensor math and may cache per block size.
+            ``block_size`` is the group's KERNEL block size (slot units),
+            ``manager_block_size`` the pool-unit size used to expand a
+            borrowed block lease.
         common_metadata_for_layout: callable ``(slot_mapping, block_table) ->
             CommonAttentionMetadata`` (normally a partial application of
             :func:`build_common_attention_metadata`).
@@ -179,7 +183,11 @@ def build_attn_metadata_per_group(
             block_size = getattr(spec, "block_size", None)
             if block_size is None:
                 block_size = attn_group.kv_cache_spec.block_size
-            slot_mapping, block_table = layout_for_block_size(block_size)
+            # kv_cache_spec.block_size = manager (pool-unit) size;
+            # block_size above may be its kernel split (r = m/g).
+            manager_block_size = attn_group.kv_cache_spec.block_size
+            slot_mapping, block_table = layout_for_block_size(
+                block_size, manager_block_size)
             metadata = builder.build(
                 common_prefix_len=0,
                 common_attn_metadata=common_metadata_for_layout(
@@ -346,6 +354,152 @@ def lock_moe_workspace() -> None:
     lock_workspace()
 
 
+
+
+# ---------------------------------------------------------------------------- #
+# KV block borrowing (PoC validation without aborting inference)
+# ---------------------------------------------------------------------------- #
+
+_ENGINE_CORE_BORROW_FLAG = "_gonka_poc_borrow_installed"
+
+
+def install_engine_core_poc_methods() -> bool:
+    """Install ``gonka_poc_borrow_blocks``/``gonka_poc_return_blocks`` on
+    ``vllm.v1.engine.core.EngineCore`` (class-level, idempotent).
+
+    The BlockPool lives in the engine-core process; the plugin entry point
+    runs there too (load_general_plugins in vllm/v1/engine/core.py:107-109, v0.25.1), so injecting
+    the methods at plugin-register time makes them reachable over the
+    UTILITY RPC (``call_utility_async`` -> ``getattr(self, method)``).
+
+    Upstream symbols pinned here:
+        * ``EngineCore`` (vllm/v1/engine/core.py:96) with ``self.scheduler``
+          (core.py:150); ``Scheduler.kv_cache_manager``
+          (vllm/v1/core/sched/scheduler.py:262)
+        * ``KVCacheManager.block_pool`` = the ONE pool shared by every
+          kv-cache group (vllm/v1/core/kv_cache_manager.py:161) and
+          ``KVCacheManager.kv_cache_config`` (kv_cache_manager.py:162)
+        * ``BlockPool.get_new_blocks`` (vllm/v1/core/block_pool.py:542) /
+          ``free_blocks`` (block_pool.py:614) / ``get_num_free_blocks``
+          (block_pool.py:692); the null block is id 0 and never in the
+          free queue (block_pool.py:188-192)
+
+    Sizing happens HERE, per kv-cache group -- the frontend-visible scalar
+    ``cache_config.block_size`` undercounts by up to block_size/min_g on
+    multi-group models (DeepSeek-V4 SWA compressor: 8 vs the main group).
+    Because the block-id namespace is pool-global, ONE lease reserves the
+    id's byte range in EVERY group's tensors simultaneously.
+
+    Version constraint: vllm == 0.25.*
+
+    Contract test:
+        tests/contract/test_v0_25_api_surface.py::test_kv_block_pool_borrow_surface
+    """
+    try:
+        from vllm.v1.engine.core import EngineCore
+    except Exception as exc:  # import environment without the v1 engine
+        logger.debug(
+            "EngineCore import failed, PoC borrow methods not installed: %s",
+            exc)
+        return False
+
+    if getattr(EngineCore, _ENGINE_CORE_BORROW_FLAG, False):
+        return True
+
+    def gonka_poc_borrow_blocks(self, num_nonces: int, seq_len: int):
+        """Lease free KV blocks for a PoC validation forward.
+
+        Returns ``{"block_ids": [...], "blocks_per_seq": int}`` or ``None``
+        when the pool cannot spare them. ``blocks_per_seq`` (the per-sequence
+        stripe) = ``max_g ceil(seq_len / manager_block_size_g)`` over every
+        kv-cache group -- one lease covers ALL groups.
+        """
+        try:
+            kv_mgr = self.scheduler.kv_cache_manager
+            block_pool = kv_mgr.block_pool
+            groups = kv_mgr.kv_cache_config.kv_cache_groups
+            blocks_per_seq = max(
+                math.ceil(int(seq_len) / int(g.kv_cache_spec.block_size))
+                for g in groups)
+        except Exception as exc:
+            logger.warning(
+                "gonka_poc_borrow_blocks: pool introspection failed: %s", exc)
+            return None
+        needed = int(num_nonces) * int(blocks_per_seq)
+        if needed <= 0 or needed > block_pool.get_num_free_blocks():
+            return None
+        try:
+            blocks = block_pool.get_new_blocks(needed)
+        except Exception:
+            return None
+        block_ids = [b.block_id for b in blocks if not b.is_null]
+        if len(block_ids) != needed:
+            # A null/placeholder block slipped in -- roll back rather than
+            # risk writing PoC K/V over the null block.
+            block_pool.free_blocks(blocks)
+            return None
+        return {"block_ids": block_ids, "blocks_per_seq": blocks_per_seq}
+
+    def gonka_poc_return_blocks(self, block_ids) -> None:
+        """Return blocks previously leased via ``gonka_poc_borrow_blocks``."""
+        if not block_ids:
+            return
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        block_pool.free_blocks(
+            [block_pool.blocks[int(bid)] for bid in block_ids])
+
+    EngineCore.gonka_poc_borrow_blocks = gonka_poc_borrow_blocks
+    EngineCore.gonka_poc_return_blocks = gonka_poc_return_blocks
+    setattr(EngineCore, _ENGINE_CORE_BORROW_FLAG, True)
+    logger.info("gonka-poc: EngineCore KV borrow/return methods installed")
+    return True
+
+
+def _utility_call(engine_client: Any):
+    """Resolve the UTILITY RPC callable or raise (feature-unavailable)."""
+    core = getattr(engine_client, "engine_core", None)
+    call = getattr(core, "call_utility_async", None)
+    if call is None:
+        raise RuntimeError(
+            "engine_core.call_utility_async unavailable on this EngineClient")
+    return call
+
+
+async def borrow_poc_blocks(
+    engine_client: Any, num_nonces: int, seq_len: int,
+) -> Optional[dict]:
+    """Frontend wrapper: ask the engine core for a KV block lease.
+
+    Upstream symbols: ``AsyncLLM.engine_core`` (vllm/v1/engine/async_llm.py:146) and
+    ``call_utility_async(method, *args)`` on the MP client
+    (vllm/v1/engine/core_client.py:1101/:1449, v0.25.1). Raises when that surface is missing or the RPC
+    fails (callers treat it as feature-unavailable and fall back);
+    returns ``None`` when the pool is merely busy.
+
+    Version constraint: vllm == 0.25.*
+    """
+    parallel = getattr(
+        getattr(engine_client, "vllm_config", None), "parallel_config", None)
+    if parallel is not None and getattr(parallel, "data_parallel_size", 1) > 1:
+        # The DP internal-LB client fans call_utility_async to EVERY engine
+        # and returns only engine-0's result: each other engine would leak a
+        # lease, and the paired return would free foreign ids on their pools
+        # (assert-crash or cross-request corruption). Refuse -> callers fall
+        # back to the abort-based legacy path.
+        raise RuntimeError(
+            "KV borrow is unsupported with data_parallel_size > 1")
+    return await _utility_call(engine_client)(
+        "gonka_poc_borrow_blocks", int(num_nonces), int(seq_len))
+
+
+async def return_poc_blocks(engine_client: Any, block_ids: list) -> None:
+    """Frontend wrapper: return a previously leased KV block set."""
+    if not block_ids:
+        return
+    await _utility_call(engine_client)(
+        "gonka_poc_return_blocks", list(block_ids))
+
+
 __all__ = [
     "build_common_attention_metadata",
     "build_attn_metadata_per_group",
@@ -353,4 +507,7 @@ __all__ = [
     "abort_all_requests",
     "unlock_moe_workspace",
     "lock_moe_workspace",
+    "install_engine_core_poc_methods",
+    "borrow_poc_blocks",
+    "return_poc_blocks",
 ]
