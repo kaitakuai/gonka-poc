@@ -1,7 +1,7 @@
 # gonka-poc
 
 Out-of-tree vLLM plugin implementing **Gonka Proof-of-Compute v2** for stock
-`vllm==0.23.*` wheels. Ships as a Python package -- no fork, no source patches.
+`vllm` 0.23.x / 0.25.x wheels. Ships as a Python package -- no fork, no source patches.
 
 > **Status (2026-06-17):** Alpha. The package is **not yet on PyPI**; install
 > directly from git (see Quick start below). The sampler residual wheel
@@ -47,9 +47,9 @@ These env vars / flags MUST be set; defaults are wrong or missing:
 |---------|-------|-----|
 | `VLLM_ALLOW_INSECURE_SERIALIZATION=1` | env | Enables msgpack between API process and worker for `collective_rpc` payloads (PoC artifacts ride this channel). |
 | `--worker-extension-cls gonka_poc.worker.PoCWorkerExtension` | CLI | Operator MUST pass this flag explicitly on `gonka-vllm-serve` (and on vanilla `vllm serve`). `gonka-vllm-serve` does NOT inject it -- we considered auto-injection but argparse mutation across the nested vLLM helpers (`make_arg_parser` / `validate_parsed_serve_args` / `FlexibleArgumentParser`) is fragile and silently breaks `--help` and unknown-flag handling. Forgetting the flag means PoC `collective_rpc` calls land on a default worker with no `execute_poc_forward` method (loud failure on first PoC round, not silent). |
-| `--attention-backend FLASHINFER` | CLI | Or `TRITON_ATTN` -- see ml-runtime conventions; the default backend is not validated for PoC. |
+| `--attention-backend FLASHINFER` | CLI | Or `TRITON_ATTN` -- the default backend is not validated for PoC. |
 | `--logprobs-mode processed_logprobs` | CLI | PoC v2 requires processed (post-temperature, post-top-p) logprobs; raw logprobs break the marker chain. |
-| `--enforce-eager` | CLI | PoC forward MUST run eager -- compiled drift breaks cross-validator bit-compat (see `feedback_poc_eager_mandatory.md`). |
+| `--enforce-eager` | CLI | PoC forward MUST run eager -- compiled drift breaks cross-validator bit-compat. |
 
 ## Quick start (`gonka-vllm-serve`)
 
@@ -107,14 +107,13 @@ crashes with `AttributeError: 'Worker' object has no attribute
 | GPU | Model | TP | PP | Notes |
 |-----|-------|----|----|-------|
 | **B200** (8x) | MiniMax M2.7 (FP8) | 2 | 1 | 2624 nonces/min reference (2-replica) |
-| **B300** (1x) | Qwen3-235B FP8 | 1 | 4 | PP=4 on RTX PRO 6000 SE pattern; see ml-runtime |
+| **B300** (1x) | Qwen3-235B FP8 | 1 | 4 | PP=4 on RTX PRO 6000 SE pattern |
 | **H100** | MiniMax M2.7 (FP8) | 4 | 1 | requires Hopper-FP8 caveats -- TRITON MoE + FLASHINFER attn |
 | **A100** | MiniMax M2.7 (FP8) | 4 | 1 | requires `--moe-backend marlin` + `VLLM_USE_FLASHINFER_MOE_FP8=0` |
 | **RTX PRO 6000 SE** | Qwen3-235B (FP8) | 1 | 4 | `--max-model-len 100000` |
 
-Validation gate per `feedback_hardware_validation_gate.md`: don't promote
-configs to downstream repos until they pass real-hardware throughput +
-L2-validity checks on the target GPU.
+Validation gate: don't promote configs to downstream repos until they pass
+real-hardware throughput + L2-validity checks on the target GPU.
 
 ## Chain integration
 
@@ -238,14 +237,15 @@ and the upstream-PR backlog.
 
 ```
 src/gonka_poc/
-  poc/            -- PoC v2 module (callbacks, queue, gpu_random, manager, ...)
+  poc/            -- PoC v2 module (callbacks, generate_queue, gpu_random, reservation, routes, ...)
   worker/         -- PoCWorkerExtension (collective_rpc surface)
   entrypoint/     -- gonka-vllm-serve composer + 503 gating middleware
-  _compat/        -- version-dispatched private-API shim (v0_23.py)
+  _compat/        -- version-dispatched private-API shim (v0_23.py, v0_25.py)
   plugin.py       -- vllm.general_plugins entry point
 tests/
   contract/       -- vLLM private-surface drift detector (read-only)
   gonka/          -- PoC live + unit tests ported from the 0.15.1 fork
+  unit/           -- plugin unit tests (gating, reservation, compat dispatch, ...)
 ```
 
 ## What's NOT here

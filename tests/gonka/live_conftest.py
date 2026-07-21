@@ -1,7 +1,7 @@
 """Shared helpers for live integration tests against a running vLLM server.
 
 Uses the same EnforcedTokens format and distance2 metric as the production
-validation pipeline (see benchmarks/src/validation/utils.py).
+validation pipeline.
 """
 import math
 import os

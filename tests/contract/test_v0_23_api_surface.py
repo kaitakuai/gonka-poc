@@ -201,7 +201,7 @@ def test_engine_client_runtime_surface() -> None:
     assert not missing_rpc, (
         f"EngineClient.collective_rpc signature drifted: missing {sorted(missing_rpc)!r}, "
         f"present = {sorted(rpc_params)!r}. "
-        f"src/gonka_poc/poc/routes.py:64 and src/gonka_poc/worker/extension.py:21 "
+        f"src/gonka_poc/poc/routes.py and src/gonka_poc/worker/extension.py "
         f"pass these as keyword args; rename / removal breaks the PoC dispatch."
     )
 
@@ -209,7 +209,7 @@ def test_engine_client_runtime_surface() -> None:
     gst = getattr(cls, "get_supported_tasks", None)
     assert gst is not None and callable(gst), (
         "EngineClient.get_supported_tasks missing -- "
-        "src/gonka_poc/entrypoint/api_router.py:172 calls "
+        "src/gonka_poc/entrypoint/api_router.py calls "
         "``await engine_client.get_supported_tasks()`` at gonka-vllm-serve "
         "init to wire up routes; without it serve init crashes."
     )
@@ -235,7 +235,7 @@ def test_engine_client_runtime_surface() -> None:
     assert "model_config" in abc_annotations, (
         f"EngineClient.model_config annotation missing from ABC; "
         f"present annotations = {sorted(abc_annotations)!r}. "
-        f"src/gonka_poc/entrypoint/api_router.py:173 does "
+        f"src/gonka_poc/entrypoint/api_router.py does "
         f"``model_config = engine_client.model_config`` to read max_model_len "
         f"etc.; if the contract no longer requires this attribute, every "
         f"concrete impl is free to omit it."
@@ -268,7 +268,7 @@ def test_engine_client_runtime_surface() -> None:
     assert has_attr, (
         "AsyncLLM no longer sets ``self.model_config`` in __init__ nor "
         "exposes it as a class attribute/property -- "
-        "src/gonka_poc/entrypoint/api_router.py:173 will raise AttributeError "
+        "src/gonka_poc/entrypoint/api_router.py will raise AttributeError "
         "on the very first request."
     )
 
@@ -544,8 +544,8 @@ def test_sampling_params_has_fork_patches() -> None:
     selection) reads them at request admission.
 
     Why this test belongs in the PLUGIN contract suite (not just the fork):
-        The plugin advertises ``vllm>=0.23.0,<0.24`` as its install pin.
-        ``pip install vllm==0.23.0`` (vanilla, no ``+gonka.sampler1``)
+        The plugin advertises ``vllm>=0.23.0,!=0.24.*,<0.26`` as its install
+        pin. ``pip install vllm==0.23.0`` (vanilla, no ``+gonka.sampler1``)
         satisfies that pin -- and the other contract tests stay GREEN
         against vanilla vllm 0.23, but engine startup crashes the moment
         a request with ``logprobs_mode`` arrives. This pin catches that
@@ -605,14 +605,18 @@ def test_sampling_params_has_fork_patches() -> None:
 # ---------------------------------------------------------------------------- #
 
 def test_openai_serving_chat_export() -> None:
-    """PoC gating middleware needs an OpenAIServingChat handle to abort
-    in-flight requests.
+    """Pin the OpenAIServingChat import path for CLI-surface stability.
+
+    Nothing in ``src/`` imports OpenAIServingChat directly — the plugin
+    reuses vLLM's own OpenAI serving stack via ``gonka-vllm-serve``. The
+    pin stays because a relocation of this class signals a restructure of
+    the OpenAI entrypoint package that the serve wiring builds on.
 
     NOTE -- v0.23 restructure: ``vllm.entrypoints.openai.serving_chat`` no
     longer exists. The class moved to
     ``vllm.entrypoints.openai.chat_completion.serving.OpenAIServingChat``.
     The ``chat_completion`` package's ``__init__.py`` does NOT re-export
-    the symbol, so the compat shim MUST import from the deep path.
+    the symbol, so any deep import must use the full path.
     """
     pytest.importorskip("vllm")
 
@@ -632,16 +636,15 @@ def test_openai_serving_chat_export() -> None:
     assert cls is not None and inspect.isclass(cls), (
         "OpenAIServingChat not found at "
         "vllm.entrypoints.openai.chat_completion.serving -- "
-        "the compat shim must search a new path "
+        "the OpenAI entrypoint package restructured again "
         "(check vllm.entrypoints.openai.chat_completion.__init__ for re-exports)."
     )
-    # Pin a method the gating middleware depends on for response handling.
-    # ``create_chat_completion`` is the documented entry point; if a future
-    # version renames it (e.g., ``handle_chat_request``), the middleware
-    # wrapper must follow.
+    # Pin the documented entry-point method; a rename (e.g.
+    # ``handle_chat_request``) signals a CLI-surface restructure worth
+    # reviewing at the next pin bump.
     assert hasattr(cls, "create_chat_completion"), (
         "OpenAIServingChat.create_chat_completion missing -- "
-        "gonka_poc gating middleware needs revision."
+        "the OpenAI chat serving surface restructured."
     )
 
 

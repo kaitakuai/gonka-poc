@@ -10,14 +10,14 @@ Tests:
   5. Multiple prompts: measure mean distance2 with grammar active
 
 Uses the same EnforcedTokens format and distance2 metric as the production
-validation pipeline (see benchmarks/src/validation/utils.py).
+validation pipeline.
 """
 import json
 import time
 import pytest
 
 from tests.gonka.live_conftest import (
-    BASE_URL, require_server, stop_poc, chat_request,
+    require_server, stop_poc, chat_request,
     build_enforced_tokens, extract_result, distance2,
 )
 

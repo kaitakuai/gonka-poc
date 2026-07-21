@@ -16,7 +16,7 @@ compat-binding regression at *import time* rather than on first forward.
 Pattern: ``pytest.importorskip("vllm")`` keeps the suite usable on
 contributor laptops without a vLLM install; once vLLM is importable, we
 resolve the compat module exactly once via the documented public API and
-assert the full attribute surface promised by ``_compat/v0_23.py::__all__``.
+assert the core attribute surface every ``_compat`` shim must expose.
 """
 from __future__ import annotations
 
@@ -32,11 +32,8 @@ pytest.importorskip("vllm")
 from gonka_poc._compat import current  # noqa: E402 -- after importorskip
 
 
-# Symbols every supported compat submodule (currently only v0_23) MUST
-# expose. Mirror of ``gonka_poc/_compat/v0_23.py::__all__``. Optional symbols
-# (e.g. install_model_runner_forward_hook if it returns) go in
-# ``_OPTIONAL_ATTRS`` -- absence is fine, but if present they must be
-# callable.
+# Core subset of symbols every supported compat submodule (``vN_M``) MUST
+# expose.
 _REQUIRED_ATTRS: tuple[str, ...] = (
     "build_common_attention_metadata",
     "build_attn_metadata_per_group",
@@ -45,10 +42,6 @@ _REQUIRED_ATTRS: tuple[str, ...] = (
     "install_engine_core_poc_methods",
     "borrow_poc_blocks",
     "return_poc_blocks",
-)
-
-_OPTIONAL_ATTRS: tuple[str, ...] = (
-    "install_model_runner_forward_hook",
 )
 
 
@@ -82,7 +75,7 @@ def test_current_exposes_required_attrs() -> None:
     missing = [name for name in _REQUIRED_ATTRS if not hasattr(compat, name)]
     assert not missing, (
         f"gonka_poc._compat.current() module is missing required attrs: "
-        f"{missing}. Expected the full surface from v0_23.py::__all__."
+        f"{missing}. Every compat shim must expose this core surface."
     )
     non_callable = [
         name for name in _REQUIRED_ATTRS if not callable(getattr(compat, name))
@@ -91,18 +84,6 @@ def test_current_exposes_required_attrs() -> None:
         f"gonka_poc._compat.current() module exposes non-callable attrs: "
         f"{non_callable}. Every compat hook must be a callable."
     )
-
-
-def test_current_optional_attrs_are_callable_if_present() -> None:
-    """Optional attrs (e.g. ``install_model_runner_forward_hook``) — if the
-    compat submodule re-introduces them, they MUST still be callable so
-    callers can dispatch uniformly."""
-    compat = _resolve_compat_module()
-    for name in _OPTIONAL_ATTRS:
-        if hasattr(compat, name):
-            assert callable(getattr(compat, name)), (
-                f"Optional compat attr {name!r} is present but not callable."
-            )
 
 
 def test_current_is_cached() -> None:
