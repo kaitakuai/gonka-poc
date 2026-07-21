@@ -20,7 +20,7 @@ were later refactored away (see git history).*
 |-----|---------|-----------------------|
 | `3efa985f8` | feat(poc): import PoC v2 module from 0.15.1 fork | `src/gonka_poc/poc/*` |
 | `2547cbc95` | feat(poc): stronger RNG via concat-murmur (upstream PR #30) | `src/gonka_poc/poc/{config,engine_patch,generate_queue,gpu_random,manager,poc_model_runner,routes}.py` |
-| `9ec7ab432` *(actually `9ec7ab432` foundry; the kv-reuse part)* | `99a372d4e` safer kv cache reuse | `src/gonka_poc/poc/poc_model_runner.py` |
+| `99a372d4e` | safer kv cache reuse (kv-reuse part; Dockerfile portion -> Section 2) | `src/gonka_poc/poc/poc_model_runner.py` |
 | `9ec7ab432` fix compilation skip | `src/gonka_poc/poc/poc_model_runner.py` (already final state) |
 | `4a4c921f0` add scratchpad (revert) | `src/gonka_poc/poc/poc_model_runner.py` (already final state) |
 | `623ef37d7` feat(api): integrate PoC router and priority gating | `src/gonka_poc/entrypoint/{api_router,gating}.py` + reuse of `src/gonka_poc/poc/routes.py` |
@@ -86,13 +86,15 @@ each vllm minor bump. Move to plugin only after an upstream PR adds a hook.
 | `e35461e0e` | feat(sampler): add need_processed_logprobs and .sample() wrapper | `vllm/v1/sample/ops/topk_topp_sampler.py` | Sampler op signature change; not pluggable. |
 | `81abd50f5` | feat(sampler): port PoC v2 mixed-mode sampling and enforced tokens | `vllm/v1/sample/sampler.py` | Core enforced-token override; sampler-stack residual. |
 | `95dce5242` | feat(worker): port InputBatch enforced-tokens and logprobs-mode bookkeeping | `vllm/v1/worker/gpu_input_batch.py`, `vllm/v1/worker/gpu_model_runner.py` | InputBatch is private worker state -- not reachable via `worker_extension_cls`. |
-| `fc77f468f` *(sampler kwarg)* | n/a -- see above for the Dockerfile-only portion | -- | -- |
 | `1a328700e` | fix(sampler): thread need_processed_logprobs through forward_xpu | `vllm/v1/sample/ops/topk_topp_sampler.py` | Continuation of sampler-op surgery. |
-| `e35461e0e` (structured-output portion not in this commit) | -- | -- | -- |
 | `8f30fd4e2` (the `_get_decoded_token` part) | chore(api): return token id as numeric string | `vllm/...` -- **DROPPED**; replaced by plugin serialiser | Already documented in Section 1; the fork edit itself stays dropped, **not** carried as a residual. |
 | `4996d5af7` | feat(structured-output): graceful degradation on grammar token rejection | `vllm/v1/structured_output/__init__.py`, `vllm/v1/structured_output/backend_xgrammar.py` | Private xgrammar internals; ADR layer-3-deferred. |
 
 ### Upstream-PR backlog (to retire each item from the fork)
+
+Upstreaming is DEFERRED-INDEFINITELY per ADR-0014 (the fork is permanent
+infrastructure; this backlog records what WOULD retire each item; revisit
+under gonka-ai ownership).
 
 1. **Sampler-stack hook**: PR upstream adding a `LogitsProcessor`-style
    per-request `enforced_token_ids` slot + `logprobs_mode` enum exposed on

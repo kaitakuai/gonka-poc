@@ -23,10 +23,6 @@ Verified call sites (vllm 0.23.0):
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger("gonka_poc.plugin")
 
@@ -137,21 +133,15 @@ def _install_build_app_warning_wrapper() -> None:
             # startup event cannot work). ``gonka-vllm-serve`` installs
             # ``PoCGatingMiddleware`` itself, so this wrapper covers ONLY the
             # bare ``vllm serve`` accident path.
-            from gonka_poc.entrypoint.gating import PoCGatingMiddleware, PoCGate
+            from gonka_poc.entrypoint.gating import PoCGate, install_gating_middleware
 
             # Sentinel gate that never activates -- the middleware acts purely
             # as the warning carrier here. ``PoCGate().is_active()`` is False
             # by construction so no real request is ever 503'd by this shim.
             sentinel_gate = PoCGate()
-            # Starlette 1.3.x finalizes the middleware stack during build_app;
-            # reset it so add_middleware rebuilds it on first dispatch (see
-            # api_router.build_gonka_app for the full rationale).
-            app.middleware_stack = None
-            app.add_middleware(
-                PoCGatingMiddleware,
-                gate=sentinel_gate,
-                blocked_prefixes=(),
-            )
+            # install_gating_middleware carries the Starlette 1.3.x
+            # stack-reset workaround (see its docstring).
+            install_gating_middleware(app, gate=sentinel_gate, blocked_prefixes=())
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "gonka_poc: failed to attach gate-presence warning to FastAPI app"

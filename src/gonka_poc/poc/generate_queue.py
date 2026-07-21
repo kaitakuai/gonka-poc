@@ -14,7 +14,7 @@ from .config import (
 from .reservation import poc_reservation
 from .validation import run_validation
 from .callbacks import get_callback_queue, clear_callback_queue
-from .data import DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
+from .data import DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD, wire_encoding
 
 logger = init_logger(__name__)
 
@@ -95,17 +95,15 @@ class GenerateQueue:
         return self._results.get(request_id)
     
     async def clear_all(self):
-        """Clear queue and results."""
+        """Clear queue and results; also signals the worker's stop_event
+        (it calls self._stop_event.set())."""
         async with self._lock:
             while not self._queue.empty():
                 try:
-                    job = self._queue.get_nowait()
-                    if job.request_id in self._results:
-                        self._results[job.request_id].status = "cancelled"
-                        self._results[job.request_id].completed_at = time.time()
+                    self._queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-            
+
             self._queued_nonces = 0
             self._results.clear()
             self._stop_event.set()
@@ -271,7 +269,7 @@ class GenerateQueue:
                 "status": "completed",
                 "request_id": job.request_id,
                 "artifacts": computed_artifacts,
-                "encoding": {"dtype": "f16", "k_dim": job.k_dim, "endian": "le"},
+                "encoding": wire_encoding(job.k_dim),
             }
         
         validation_result = run_validation(

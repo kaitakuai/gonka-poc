@@ -14,7 +14,7 @@ from .config import (
     POC_CALLBACK_MAX_RETRIES,
     POC_CALLBACK_QUEUE_SIZE,
 )
-from .data import Artifact
+from .data import Artifact, wire_encoding
 
 logger = init_logger(__name__)
 
@@ -23,7 +23,11 @@ POC_CALLBACK_RETRY_MAX_BACKOFF_SEC = 30.0
 
 
 class CallbackSender:
-    """Manages callback sending with retry and bounded buffer."""
+    """Manages callback sending with retry and bounded buffer.
+
+    Mining path: owned by /init/generate; streams cadence-batched artifacts
+    to {url}/generated.
+    """
     
     def __init__(
         self,
@@ -40,7 +44,6 @@ class CallbackSender:
         self._buffer: deque[Artifact] = deque()
         self._metadata: Dict[str, Any] = {}
         self._pending_payload: Optional[Dict] = None
-        self._task: Optional[asyncio.Task] = None
     
     def add_artifacts(self, artifacts: List[Artifact], metadata: Dict[str, Any]):
         """Add artifacts to buffer, dropping oldest if cap exceeded."""
@@ -81,13 +84,13 @@ class CallbackSender:
                     self._pending_payload = {
                         **self._metadata,
                         "artifacts": [{"nonce": a.nonce, "vector_b64": a.vector_b64} for a in artifacts_to_send],
-                        "encoding": {"dtype": "f16", "k_dim": self.k_dim, "endian": "le"},
+                        "encoding": wire_encoding(self.k_dim),
                     }
                     retry_attempt = 0
                 
                 if self._pending_payload:
                     retry_attempt += 1
-                    success = await self._send_callback(session, self._pending_payload, retry_attempt)
+                    success = await self._send_callback(session, self._pending_payload)
                     if success:
                         if retry_attempt > 1:
                             logger.info(f"Callback to {self.callback_url} succeeded after {retry_attempt} attempts")
@@ -108,7 +111,7 @@ class CallbackSender:
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, POC_CALLBACK_RETRY_MAX_BACKOFF_SEC)
     
-    async def _send_callback(self, session: aiohttp.ClientSession, payload: Dict, attempt: int = 1) -> bool:
+    async def _send_callback(self, session: aiohttp.ClientSession, payload: Dict) -> bool:
         """Send callback, return True on success."""
         try:
             async with session.post(
@@ -125,7 +128,11 @@ class CallbackSender:
 
 
 class CallbackQueue:
-    """Queue for reliable callback delivery with bounded concurrency."""
+    """Queue for reliable callback delivery with bounded concurrency.
+
+    Queued-/generate path: owned by GenerateQueue's worker; delivers one
+    payload per job to {url}/generated (artifacts) or {url}/validated (verdict).
+    """
 
     def __init__(
         self,

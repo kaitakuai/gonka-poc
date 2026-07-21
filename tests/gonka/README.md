@@ -47,7 +47,7 @@ names, dataclass fields, method signatures). Run on every vLLM pin bump.
 No GPU, no running server. From the repo root:
 
 ```bash
-pip install -e '.[test]'   # or:  pip install git+https://github.com/kaitakuai/gonka-poc@main
+pip install -e '.[test]'   # or:  pip install 'gonka-poc[test] @ git+https://github.com/kaitakuai/gonka-poc@main'
 pytest tests/unit tests/contract -v
 ```
 
