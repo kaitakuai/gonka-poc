@@ -40,7 +40,7 @@ from fastapi import FastAPI
 from gonka_poc.entrypoint.gating import (
     DEFAULT_BLOCKED_PREFIXES,
     PoCGate,
-    PoCGatingMiddleware,
+    install_gating_middleware,
 )
 
 logger = logging.getLogger("gonka_poc.entrypoint")
@@ -97,13 +97,9 @@ def build_gonka_app(
         if blocked_prefixes is not None
         else DEFAULT_BLOCKED_PREFIXES
     )
-    # Starlette 1.3.x (shipped with vLLM 0.23) finalizes the middleware stack
-    # eagerly, so add_middleware() after build_app raises "Cannot add middleware
-    # after an application has started". Reset the stack so Starlette rebuilds it
-    # (incorporating PoCGatingMiddleware) on first dispatch — safe here: we run
-    # before serve_http (no real request yet) and resetting a None stack is a no-op.
-    app.middleware_stack = None
-    app.add_middleware(PoCGatingMiddleware, gate=gate, blocked_prefixes=prefixes)
+    # Stack-reset + add_middleware pair lives in install_gating_middleware
+    # (see its docstring for the Starlette 1.3.x rationale).
+    install_gating_middleware(app, gate=gate, blocked_prefixes=prefixes)
 
     # The "plugin loaded but no gate attached" warning is carried by
     # PoCGatingMiddleware._maybe_warn_missing_gate (one-shot on first dispatch).

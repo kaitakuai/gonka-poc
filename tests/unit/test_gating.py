@@ -255,14 +255,34 @@ def test_503_body_is_json_with_retry_after(
 # --------------------------------------------------------------------------- #
 
 
+@pytest.fixture
+def plugin_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force ``gonka_poc.PLUGIN_LOADED = True`` for the test.
+
+    ``monkeypatch`` restores the original value on teardown, replacing the
+    manual save/set/try/finally-restore blocks this file used to copy-paste.
+    """
+    import gonka_poc
+
+    monkeypatch.setattr(gonka_poc, "PLUGIN_LOADED", True, raising=False)
+
+
+@pytest.fixture
+def plugin_not_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force ``gonka_poc.PLUGIN_LOADED = False`` for the test (twin of
+    :func:`plugin_loaded`)."""
+    import gonka_poc
+
+    monkeypatch.setattr(gonka_poc, "PLUGIN_LOADED", False, raising=False)
+
+
 def test_gate_presence_warning_fires_when_state_missing(
+    plugin_loaded: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """If PLUGIN_LOADED is True and app.state.gonka_gate is missing, the
     middleware logs a warning on the first HTTP request.
     """
-    import gonka_poc
-
     app = FastAPI()
     # Intentionally do NOT set app.state.gonka_gate -- this is the
     # bare ``vllm serve`` accident path.
@@ -277,67 +297,55 @@ def test_gate_presence_warning_fires_when_state_missing(
     async def healthz() -> dict:
         return {"ok": True}
 
-    original = getattr(gonka_poc, "PLUGIN_LOADED", False)
-    gonka_poc.PLUGIN_LOADED = True
-    try:
-        with caplog.at_level("WARNING", logger="gonka_poc.entrypoint.gating"):
-            with TestClient(app) as client:
-                r1 = client.get("/_healthz")
-                r2 = client.get("/_healthz")
-        assert r1.status_code == 200
-        assert r2.status_code == 200
+    with caplog.at_level("WARNING", logger="gonka_poc.entrypoint.gating"):
+        with TestClient(app) as client:
+            r1 = client.get("/_healthz")
+            r2 = client.get("/_healthz")
+    assert r1.status_code == 200
+    assert r2.status_code == 200
 
-        warnings = [
-            rec for rec in caplog.records
-            if "gonka_poc plugin loaded but app.state.gonka_gate is missing" in rec.message
-        ]
-        assert len(warnings) == 1, (
-            f"Expected exactly one gate-presence warning across two requests; "
-            f"got {len(warnings)}. Records: {[r.message for r in caplog.records]}"
-        )
-    finally:
-        gonka_poc.PLUGIN_LOADED = original
+    warnings = [
+        rec for rec in caplog.records
+        if "gonka_poc plugin loaded but app.state.gonka_gate is missing" in rec.message
+    ]
+    assert len(warnings) == 1, (
+        f"Expected exactly one gate-presence warning across two requests; "
+        f"got {len(warnings)}. Records: {[r.message for r in caplog.records]}"
+    )
 
 
 def test_gate_presence_warning_silent_when_gate_attached(
+    plugin_loaded: None,
     app_and_gate: tuple[FastAPI, PoCGate],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Happy path: ``app.state.gonka_gate`` IS set, so the middleware MUST
     NOT log the warning -- this is the ``gonka-vllm-serve`` configuration.
     """
-    import gonka_poc
-
     app, _gate = app_and_gate
-    original = getattr(gonka_poc, "PLUGIN_LOADED", False)
-    gonka_poc.PLUGIN_LOADED = True
-    try:
-        with caplog.at_level("WARNING", logger="gonka_poc.entrypoint.gating"):
-            with TestClient(app) as client:
-                r = client.post("/v1/chat/completions")
-        assert r.status_code == 200
+    with caplog.at_level("WARNING", logger="gonka_poc.entrypoint.gating"):
+        with TestClient(app) as client:
+            r = client.post("/v1/chat/completions")
+    assert r.status_code == 200
 
-        warnings = [
-            rec for rec in caplog.records
-            if "gonka_poc plugin loaded but app.state.gonka_gate is missing" in rec.message
-        ]
-        assert warnings == [], (
-            f"Gate IS present; warning must not fire. Got: "
-            f"{[r.message for r in warnings]}"
-        )
-    finally:
-        gonka_poc.PLUGIN_LOADED = original
+    warnings = [
+        rec for rec in caplog.records
+        if "gonka_poc plugin loaded but app.state.gonka_gate is missing" in rec.message
+    ]
+    assert warnings == [], (
+        f"Gate IS present; warning must not fire. Got: "
+        f"{[r.message for r in warnings]}"
+    )
 
 
 def test_gate_presence_warning_silent_when_plugin_not_loaded(
+    plugin_not_loaded: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """If the plugin entry point never ran (PLUGIN_LOADED is False), there's
     nothing to warn about even when no gate is attached -- the user simply
     isn't using gonka_poc in this process.
     """
-    import gonka_poc
-
     app = FastAPI()
     sentinel_gate = PoCGate()
     app.add_middleware(
@@ -350,24 +358,19 @@ def test_gate_presence_warning_silent_when_plugin_not_loaded(
     async def healthz() -> dict:
         return {"ok": True}
 
-    original = getattr(gonka_poc, "PLUGIN_LOADED", False)
-    gonka_poc.PLUGIN_LOADED = False
-    try:
-        with caplog.at_level("WARNING", logger="gonka_poc.entrypoint.gating"):
-            with TestClient(app) as client:
-                r = client.get("/_healthz")
-        assert r.status_code == 200
+    with caplog.at_level("WARNING", logger="gonka_poc.entrypoint.gating"):
+        with TestClient(app) as client:
+            r = client.get("/_healthz")
+    assert r.status_code == 200
 
-        warnings = [
-            rec for rec in caplog.records
-            if "gonka_poc plugin loaded but app.state.gonka_gate is missing" in rec.message
-        ]
-        assert warnings == [], (
-            f"PLUGIN_LOADED was False; warning must not fire. Got: "
-            f"{[r.message for r in warnings]}"
-        )
-    finally:
-        gonka_poc.PLUGIN_LOADED = original
+    warnings = [
+        rec for rec in caplog.records
+        if "gonka_poc plugin loaded but app.state.gonka_gate is missing" in rec.message
+    ]
+    assert warnings == [], (
+        f"PLUGIN_LOADED was False; warning must not fire. Got: "
+        f"{[r.message for r in warnings]}"
+    )
 
 
 def test_build_gonka_app_survives_finalized_middleware_stack() -> None:

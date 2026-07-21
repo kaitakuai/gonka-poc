@@ -176,6 +176,33 @@ def generate_inputs_concat_murmur(
     return result
 
 
+def derive_pseudo_input_ids(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    seq_len: int,
+    vocab: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Deterministic pseudo token ids for token-id-dependent architectures.
+
+    Ids are derived from the same ``(block_hash, public_key, nonce)`` seed
+    scheme as the input embeddings (``_input_ids`` suffix), through the same
+    framework-independent murmur3 pipeline — pure integer arithmetic, stable
+    across torch versions (a consensus requirement).
+    """
+    batch_size = len(nonces)
+    keys = torch.arange(seq_len, dtype=torch.int32, device=device)
+    keys = keys.unsqueeze(0).expand(batch_size, -1)
+    seeds = torch.tensor(
+        [[_seed_from_string(f"{block_hash}_{public_key}_nonce{n}_input_ids")]
+         for n in nonces],
+        dtype=torch.int64, device=device)
+    # murmur3 yields uniform uint32; modulo bias at vocab << 2^32 is
+    # negligible for routing purposes.
+    return (_batched_murmur3_32(keys, seeds) % vocab).to(torch.int32).flatten()
+
+
 def generate_householder_vector(
     seed_str: str,
     dim: int,

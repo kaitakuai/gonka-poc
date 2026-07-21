@@ -6,7 +6,10 @@ DIFFERENT block sizes (V4: sparse MLA / indexer at ``cache_config.block_size``,
 SWA compressor at 8). A single slot_mapping built for the main group hands
 out-of-range slot ids to the other pools — OOB writes crash on sm_90 and
 silently corrupt memory on sm_100. The runner therefore builds the layout per
-group; these tests pin the layout math and the ids scheme, CPU-only, no vllm.
+group; these tests pin the layout math and the ids scheme, CPU-only. The
+layout tests exercise ``poc_model_runner._inplace_layout`` directly and skip
+when vllm is unavailable (``poc_model_runner`` imports it at module level);
+the ids tests need only ``gpu_random`` and always run.
 """
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ import math
 import pytest
 import torch
 
-from gonka_poc.poc.gpu_random import _batched_murmur3_32, _seed_from_string
+from gonka_poc.poc.gpu_random import _seed_from_string, derive_pseudo_input_ids
 
 
 # --------------------------------------------------------------------------- #
@@ -33,13 +36,16 @@ def _naive_layout(batch_size: int, seq_len: int, g_block: int) -> torch.Tensor:
     return torch.tensor(slots, dtype=torch.long)
 
 
+def _inplace_layout(batch_size: int, seq_len: int, g_block: int):
+    # The REAL implementation (shared with ``_create_v1_attn_metadata._layout``).
+    runner = pytest.importorskip(
+        "gonka_poc.poc.poc_model_runner", reason="requires vllm")
+    return runner._inplace_layout(
+        batch_size, seq_len, g_block, torch.device("cpu"))
+
+
 def _vectorized_layout(batch_size: int, seq_len: int, g_block: int) -> torch.Tensor:
-    # Mirrors ``poc_model_runner._create_v1_attn_metadata._layout``.
-    blocks_per_seq = math.ceil(seq_len / g_block)
-    padded = blocks_per_seq * g_block
-    base = (torch.arange(batch_size, dtype=torch.long)
-            * padded).repeat_interleave(seq_len)
-    return base + torch.arange(seq_len, dtype=torch.long).repeat(batch_size)
+    return _inplace_layout(batch_size, seq_len, g_block)[0]
 
 
 @pytest.mark.parametrize(
@@ -62,10 +68,7 @@ def test_vectorized_layout_matches_naive(batch_size, seq_len, g_block):
 
 
 def _block_table(batch_size: int, seq_len: int, g_block: int) -> torch.Tensor:
-    blocks_per_seq = math.ceil(seq_len / g_block)
-    return torch.arange(
-        batch_size * blocks_per_seq, dtype=torch.int32
-    ).view(batch_size, blocks_per_seq)
+    return _inplace_layout(batch_size, seq_len, g_block)[1]
 
 
 def test_per_group_block_tables_differ():
@@ -95,15 +98,9 @@ def test_per_group_block_tables_differ():
 # --------------------------------------------------------------------------- #
 
 def _derive_ids(block_hash, public_key, nonces, seq_len, vocab):
-    # Mirrors ``poc_model_runner._generate_poc_input_ids`` (CPU device).
-    batch_size = len(nonces)
-    keys = torch.arange(seq_len, dtype=torch.int32)
-    keys = keys.unsqueeze(0).expand(batch_size, -1)
-    seeds = torch.tensor(
-        [[_seed_from_string(f"{block_hash}_{public_key}_nonce{n}_input_ids")]
-         for n in nonces],
-        dtype=torch.int64)
-    return (_batched_murmur3_32(keys, seeds) % vocab).to(torch.int32).flatten()
+    # The REAL implementation (called by ``poc_model_runner._generate_poc_input_ids``).
+    return derive_pseudo_input_ids(
+        block_hash, public_key, nonces, seq_len, vocab, torch.device("cpu"))
 
 
 def test_pseudo_ids_deterministic_and_in_range():

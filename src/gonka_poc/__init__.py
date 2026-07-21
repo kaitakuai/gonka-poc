@@ -4,10 +4,11 @@ This package ships as a standalone pip-installable plugin that targets a stock
 vllm wheel (0.23.x / 0.25.x). It provides three integration surfaces:
 
 1. ``vllm.general_plugins`` entry point (:func:`gonka_poc.plugin.register`)
-   that sets a process-local ``PLUGIN_LOADED`` flag and installs a one-shot
+   that sets a process-local ``PLUGIN_LOADED`` flag, installs a one-shot
    wrapper around ``vllm.entrypoints.openai.api_server.build_app`` so a
    gate-presence warning fires when the operator runs ``vllm serve`` instead
-   of ``gonka-vllm-serve``.
+   of ``gonka-vllm-serve``, and installs the EngineCore KV borrow/return
+   utility methods for leased-block validation (ADR-0015).
 2. ``--worker-extension-cls gonka_poc.worker.PoCWorkerExtension`` exposing
    ``execute_poc_forward`` to vLLM's ``collective_rpc``.
 3. ``gonka-vllm-serve`` console script that composes a FastAPI app on top of

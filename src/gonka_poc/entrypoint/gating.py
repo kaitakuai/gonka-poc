@@ -6,15 +6,17 @@ Modeled on ``vllm/entrypoints/serve/elastic_ep/middleware.py:ScalingMiddleware``
 
 In-flight aborts: a Starlette middleware cannot directly cancel a
 ``StreamingResponse`` that has already begun yielding bytes. The companion
-shutdown path is the explicit ``EngineClient.abort_request(request_id)``
-call issued from the PoC router itself (see ``api_router.py``) right before
-GPU work starts. The middleware is purely a "don't accept new work" gate.
+shutdown path is the ``compat.abort_all_requests(engine_client)`` calls
+issued from ``gonka_poc.poc.routes`` (init_generate; per-chunk legacy
+re-drain) and ``gonka_poc.poc.reservation`` before GPU work starts. The
+middleware is purely a "don't accept new work" gate.
 """
 from __future__ import annotations
 
 import logging
 from typing import Iterable, Optional
 
+from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -156,4 +158,29 @@ class PoCGatingMiddleware:
             logger.exception("gonka_poc: gate-presence warning check raised")
 
 
-__all__ = ["PoCGate", "PoCGatingMiddleware", "DEFAULT_BLOCKED_PREFIXES"]
+def install_gating_middleware(
+    app: Starlette,
+    gate: PoCGate,
+    blocked_prefixes: Iterable[str],
+) -> None:
+    """Install :class:`PoCGatingMiddleware` on an already-built app.
+
+    Starlette 1.3.x (shipped with vLLM 0.23) finalizes the middleware stack
+    eagerly, so ``add_middleware()`` after upstream ``build_app`` returns
+    raises "Cannot add middleware after an application has started". Reset the
+    stack so Starlette rebuilds it (incorporating ``PoCGatingMiddleware``) on
+    first dispatch -- safe because both callers run before ``serve_http``
+    (no real request yet) and resetting a None stack is a no-op.
+    """
+    app.middleware_stack = None
+    app.add_middleware(
+        PoCGatingMiddleware, gate=gate, blocked_prefixes=blocked_prefixes
+    )
+
+
+__all__ = [
+    "PoCGate",
+    "PoCGatingMiddleware",
+    "DEFAULT_BLOCKED_PREFIXES",
+    "install_gating_middleware",
+]

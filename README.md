@@ -3,25 +3,27 @@
 Out-of-tree vLLM plugin implementing **Gonka Proof-of-Compute v2** for stock
 `vllm` 0.23.x / 0.25.x wheels. Ships as a Python package -- no fork, no source patches.
 
-> **Status (2026-06-17):** Alpha. The package is **not yet on PyPI**; install
-> directly from git (see Quick start below). The sampler residual wheel
-> `vllm==0.23.0+gonka.sampler1` is also not on a public index. Until both
-> land, the production path is the legacy `kaitakuai/vllm` fork (not
-> `pip install`). See `MIGRATION_FROM_FORK.md` Section 3 and ADR-0014 for the
-> two-artifact relationship.
+> **Status (2026-07-21):** The package is **not yet on PyPI**; install
+> directly from git (see Quick start below). Production images since the
+> 0.23 foundry pipeline install `gonka-poc` via pip on top of the per-minor
+> residual wheel (`poc-sampler-residual-vX.YY` scheme, ADR-0014); vLLM 0.23
+> and 0.25.1 are supported. See `MIGRATION_FROM_FORK.md` Section 3 and
+> ADR-0014 for the two-artifact relationship.
 
 ## What it provides
 
-1. **PoC API router** under `/api/v1/pow/*` (init/generate/status/stop) +
+1. **PoC API router** under `/api/v1/pow/*` (init/generate/versions/status/stop) +
    503/abort gating against `/v1/chat/completions` and `/v1/completions`
    while PoC generation is active.
 2. **PoCWorkerExtension** -- `execute_poc_forward` reachable through vLLM's
    public `collective_rpc` (replaces the previous AsyncLLM monkey-patch).
 3. **`vllm.general_plugins` entry point** -- sets a process-local
-   `PLUGIN_LOADED` flag and installs a one-shot wrapper around
+   `PLUGIN_LOADED` flag, installs a one-shot wrapper around
    `vllm.entrypoints.openai.api_server.build_app` that warns when the
    chat endpoint is unprotected (operator ran `vllm serve` instead of
-   `gonka-vllm-serve`).
+   `gonka-vllm-serve`), and installs the EngineCore KV borrow/return
+   utility methods for leased-block validation (ADR-0015); without them
+   validation degrades to the abort-inference path.
 
 The sampler-stack residual (enforced-token sampling, `logprobs_mode`) is
 **not** part of this plugin -- it remains as a thin fork until vLLM grows a
@@ -195,13 +197,31 @@ and live stats (total_processed, nonces_per_second).
 
 Cancels the active round, drains the queue, clears callback senders. Idempotent.
 
+### `GET /api/v1/pow/versions`
+
+Feature-detection handshake for the chain/network node. Returns
+`vllm_version`, `gonka_poc_version`, and `poc_validation_inference` --
+whether `/generate` validation can run on leased KV blocks concurrently
+with live inference (reflects an actual probe, never a hardcoded literal).
+
 ### Callback contract
 
-When `url` is provided on `init/generate` or `generate`, the node POSTs
-batched artifacts to `{url}/generated` on a `POC_CALLBACK_INTERVAL_SEC`
-cadence (default 5s). Each callback body carries the public_key,
-block_hash, block_height, node_id, and a list of `{nonce, vector_b64}`
-artifacts in `k_dim`-dimensional FP16 little-endian encoding.
+The two generation paths deliver callbacks differently:
+
+* **Mining path (`init/generate`)** -- the node POSTs batched artifacts to
+  `{url}/generated` on a `POC_CALLBACK_INTERVAL_SEC` cadence (default 5s).
+  Each body carries the public_key, block_hash, block_height, node_id, a
+  list of `{nonce, vector_b64}` artifacts, and an `encoding` descriptor
+  (`k_dim`-dimensional FP16 little-endian).
+* **Queued path (`generate` with `wait=false`)** -- ONE POST at job
+  completion, not on a cadence:
+  * no `validation` attached -> POST to `{url}/generated` with
+    `request_id`, block_hash, block_height, public_key, node_id, the full
+    `artifacts` list, and the `encoding` descriptor;
+  * `validation` attached -> POST to `{url}/validated` with the verdict:
+    `request_id`, block_hash, block_height, public_key, node_id,
+    `n_total`, `n_mismatch`, `mismatch_nonces`, `p_value`,
+    `fraud_detected`.
 
 ### Pointing the chain orchestrator at the OpenAI endpoint
 
@@ -228,7 +248,9 @@ see **ADR-0014** in this repo's `docs/adr/`. Short version:
 * The fork is rebuilt as `vllm==0.23.0+gonka.samplerN` for each vLLM minor
   bump. Each upstream PR that adds a hook retires part of the fork; once
   all three hooks land, the fork is archived and `pip install gonka-poc`
-  becomes the single artifact.
+  becomes the single artifact. Upstreaming is DEFERRED-INDEFINITELY per
+  ADR-0014 (the fork is permanent infrastructure; the backlog records what
+  WOULD retire each item; revisit under gonka-ai ownership).
 
 See `MIGRATION_FROM_FORK.md` Section 3 for the per-commit fork inventory
 and the upstream-PR backlog.

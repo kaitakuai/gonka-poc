@@ -18,7 +18,7 @@ from .config import (
     POC_RPC_TIMEOUT_MS,
     PoCState,
 )
-from .data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
+from .data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD, wire_encoding
 from .callbacks import CallbackSender
 from .generate_queue import GenerateJob, get_queue, clear_queue
 from .reservation import (
@@ -151,7 +151,13 @@ class PoCInitGenerateRequest(BaseModel):
 
 @dataclass
 class NonceIterator:
-    """Iterator for nonces with multi-node and multi-group support."""
+    """Iterator for nonces with multi-node and multi-group support.
+
+    Binding contract: the offset/step formula
+    (nonce = node_id + group_id*n_nodes + x*(n_groups*n_nodes)) is the
+    network-wide disjoint nonce-partition scheme — frozen; changing it
+    breaks disjoint coverage across nodes/groups.
+    """
     node_id: int
     n_nodes: int
     group_id: int
@@ -234,6 +240,10 @@ def check_params_match(request: Request, params: PoCParamsModel):
                     }
                 )
     
+    # Optional integrator pin — set app.state.poc_deployed =
+    # {'model': ..., 'seq_len': ..., 'k_dim': ...} to enforce full param
+    # matching; nothing in this repo sets it, so by default only the model
+    # name is checked.
     deployed = getattr(request.app.state, 'poc_deployed', None)
     if deployed:
         mismatches = []
@@ -701,7 +711,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             "status": "completed",
             "request_id": str(uuid.uuid4()),
             "artifacts": computed_artifacts,
-            "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le"},
+            "encoding": wire_encoding(body.params.k_dim),
         }
     
     validation_result = run_validation(

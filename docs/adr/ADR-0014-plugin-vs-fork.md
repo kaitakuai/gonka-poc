@@ -19,8 +19,8 @@ model without leaving the package.
   the two-artifact relationship).
 - "Why two artifacts" section (`see ADR-0014 in this repo's docs/adr/`).
 
-`tests/gonka/README.md` also cites it alongside ADR-0013 when explaining
-why `test_chat_priority_gating.py` was deleted in the arch refactor. Without
+`tests/gonka/README.md` also cites it when explaining why
+`Dockerfile.quick` is not part of this repo. Without
 a local file, those citations are dead links. This stub closes the link-rot.
 The full options-considered narrative (status-quo, monkey-patch sampler,
 full-fork rebase, thin-fork-permanent) lived in the original mlnode-foundry

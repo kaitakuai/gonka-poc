@@ -1,4 +1,5 @@
-"""PoC model runner for vLLM 0.23.x V1 architecture.
+"""PoC model runner for the vLLM V1 architecture (supported minors per
+``gonka_poc._compat``); version-specific surfaces live in the compat shim.
 
 Full model forward pass with proper V1 attention metadata.
 Uses actual KV cache blocks for attention to work correctly.
@@ -48,6 +49,7 @@ from gonka_poc._compat import current as _compat_current
 from .gpu_random import (
     generate_inputs,
     generate_inputs_concat_murmur,
+    derive_pseudo_input_ids,
     random_pick_indices,
     apply_haar_rotation,
 )
@@ -143,6 +145,25 @@ def _borrowed_layout(
     return slot_mapping, block_table
 
 
+def _inplace_layout(batch_size, seq_len, g_block, device):
+    """Legacy in-place slot_mapping + block_table over blocks ``0..N``.
+
+    slot = (seq_idx*blocks_per_seq + t//g_block)*g_block + t%g_block
+         = seq_idx*padded_len + t   (contiguous per sequence, padded to
+    a block multiple), so the mapping vectorizes to two aranges.
+    """
+    blocks_per_seq = math.ceil(seq_len / g_block)
+    padded = blocks_per_seq * g_block
+    base = (torch.arange(batch_size, dtype=torch.long, device=device)
+            * padded).repeat_interleave(seq_len)
+    slot_mapping = base + torch.arange(
+        seq_len, dtype=torch.long, device=device).repeat(batch_size)
+    block_table = torch.arange(
+        batch_size * blocks_per_seq, dtype=torch.int32, device=device
+    ).view(batch_size, blocks_per_seq)
+    return slot_mapping, block_table
+
+
 def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions,
                              borrowed_block_ids=None, borrowed_stripe=None):
     """Create attention metadata, built independently for every attention group.
@@ -187,20 +208,7 @@ def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions,
             return _borrowed_layout(
                 batch_size, seq_len, g_block, m_block,
                 borrowed_block_ids, int(borrowed_stripe or 0), device)
-        # Legacy in-place layout:
-        # slot = (seq_idx*blocks_per_seq + t//g_block)*g_block + t%g_block
-        #      = seq_idx*padded_len + t   (contiguous per sequence, padded to
-        # a block multiple), so the mapping vectorizes to two aranges.
-        blocks_per_seq = math.ceil(seq_len / g_block)
-        padded = blocks_per_seq * g_block
-        base = (torch.arange(batch_size, dtype=torch.long, device=device)
-                * padded).repeat_interleave(seq_len)
-        slot_mapping = base + torch.arange(
-            seq_len, dtype=torch.long, device=device).repeat(batch_size)
-        block_table = torch.arange(
-            batch_size * blocks_per_seq, dtype=torch.int32, device=device
-        ).view(batch_size, blocks_per_seq)
-        return slot_mapping, block_table
+        return _inplace_layout(batch_size, seq_len, g_block, device)
 
     layouts = {}
 
@@ -240,28 +248,16 @@ def _generate_poc_input_ids(block_hash, public_key, nonces, seq_len, worker, dev
 
     DeepSeek-V4's hash-MoE layers route experts via ``tid2eid[input_ids]``
     and hard-fail on ``input_ids=None``. PoC has no real tokens, so ids are
-    derived from the same ``(block_hash, public_key, nonce)`` seed scheme as
-    the input embeddings (``_input_ids`` suffix), through the same
-    framework-independent murmur3 pipeline as ``gpu_random`` — pure integer
-    arithmetic, stable across torch versions (a consensus requirement).
+    derived via :func:`gpu_random.derive_pseudo_input_ids` (see its docstring
+    for the consensus-critical derivation convention).
     Gated by model_type so every other architecture keeps ``input_ids=None``.
     """
     hf_cfg = getattr(
         getattr(worker.model_runner, "model_config", None), "hf_config", None)
     if getattr(hf_cfg, "model_type", None) != "deepseek_v4":
         return None
-    from .gpu_random import _seed_from_string, _batched_murmur3_32
-    vocab = int(hf_cfg.vocab_size)
-    batch_size = len(nonces)
-    keys = torch.arange(seq_len, dtype=torch.int32, device=device)
-    keys = keys.unsqueeze(0).expand(batch_size, -1)
-    seeds = torch.tensor(
-        [[_seed_from_string(f"{block_hash}_{public_key}_nonce{n}_input_ids")]
-         for n in nonces],
-        dtype=torch.int64, device=device)
-    # murmur3 yields uniform uint32; modulo bias at vocab << 2^32 is
-    # negligible for routing purposes.
-    return (_batched_murmur3_32(keys, seeds) % vocab).to(torch.int32).flatten()
+    return derive_pseudo_input_ids(
+        block_hash, public_key, nonces, seq_len, int(hf_cfg.vocab_size), device)
 
 
 def _select_poc_kv_scratch(

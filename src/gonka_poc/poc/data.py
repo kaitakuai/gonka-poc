@@ -33,6 +33,11 @@ def decode_vector(b64: str) -> np.ndarray:
     return f16.astype(np.float32)
 
 
+def wire_encoding(k_dim: int) -> dict:
+    """Wire-protocol encoding descriptor for artifact vectors."""
+    return {"dtype": "f16", "k_dim": k_dim, "endian": "le"}
+
+
 def fraud_test(
     n_mismatch: int,
     n_total: int,

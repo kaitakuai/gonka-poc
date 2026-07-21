@@ -1,4 +1,6 @@
-"""PoCWorkerExtension -- mixed into the vLLM v0.23 GPU Worker via ``--worker-extension-cls``.
+"""PoCWorkerExtension -- mixed into the vLLM V1 GPU Worker via ``--worker-extension-cls``
+(supported minors per ``gonka_poc._compat``; version-specific surfaces live in
+the compat shim).
 
 Activation:
     vllm serve <model> --worker-extension-cls gonka_poc.worker.PoCWorkerExtension
@@ -23,8 +25,11 @@ Invocation (from the API server / async engine):
         args=(),
         kwargs={"block_hash": ..., "public_key": ..., "nonces": [...],
                 "seq_len": int, "k_dim": int, "poc_stronger_rng": bool},
-        timeout=POC_RPC_TIMEOUT_S,
+        timeout=POC_RPC_TIMEOUT_MS / 1000,
     )
+
+    (``collective_rpc`` takes seconds; the env knob is ``POC_RPC_TIMEOUT_MS``,
+    milliseconds, in ``gonka_poc.poc.config``.)
 
 CONTRACT WARNINGS:
 - Method names MUST NOT collide with any public Worker attribute -- vLLM
@@ -120,7 +125,6 @@ class PoCWorkerExtension:
         public_key: str,
         nonces: List[int],
         seq_len: int,
-        hidden_size: Optional[int] = None,
         k_dim: int = 12,
         poc_stronger_rng: bool = False,
         borrowed_block_ids: Optional[List[int]] = None,
@@ -133,9 +137,6 @@ class PoCWorkerExtension:
             nonces: list[int] of nonces to compute artifacts for; one batched
                 forward processes all of them.
             seq_len: sequence length per nonce.
-            hidden_size: model hidden size. If ``None`` it is resolved from
-                ``self.vllm_config.model_config.get_hidden_size()`` (so the
-                API server doesn't have to thread it through every call).
             k_dim: artifact vector dimensionality (default 12).
             poc_stronger_rng: if True, use murmur-concat RNG path; default
                 False (legacy seeded normal path).
@@ -166,16 +167,10 @@ class PoCWorkerExtension:
         if not nonces:
             return {"artifacts": [], "rank": int(getattr(self, "rank", -1))}
 
-        if hidden_size is None:
-            # vllm_config.model_config.get_hidden_size() is the v0.23
-            # canonical accessor; fall back to model_config directly if a
-            # future restructure splits the config tree.
-            try:
-                hidden_size = int(
-                    self.vllm_config.model_config.get_hidden_size()
-                )
-            except AttributeError:
-                hidden_size = int(self.model_config.get_hidden_size())
+        # vllm_config.model_config.get_hidden_size() is the canonical
+        # accessor on all supported minors; an unmapped minor already
+        # hard-fails in gonka_poc._compat, so no fallback is needed.
+        hidden_size = int(self.vllm_config.model_config.get_hidden_size())
 
         # Unlock the vLLM 0.23 lockable MoE workspace around the PoC forward so
         # the larger PoC MoE shape can grow it once, then re-lock (see
