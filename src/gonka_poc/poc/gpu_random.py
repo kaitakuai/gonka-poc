@@ -1,9 +1,8 @@
-"""Deterministic GPU-based random generation for PoC.
+"""Deterministic seeded RNG primitives for the PoC forward.
 
-Core primitives for generating reproducible random tensors seeded by
-(block_hash, public_key, nonce). Used by the production inference pipeline.
-
-OPTIMIZED: Serial Python loops replaced with batched GPU operations.
+Reproducible random tensors seeded by (block_hash, public_key, nonce).
+CONSENSUS-CRITICAL: outputs must be bit-identical across prover and
+validator.
 """
 import hashlib
 import math
@@ -17,6 +16,8 @@ def _seed_from_string(seed_string: str) -> int:
     return int(h[:8], 16)
 
 
+# _murmur3_32/_batched_murmur3_32 are kept separate deliberately — consensus
+# bit-compat; do not unify without a cross-validator bit-compat harness.
 def _murmur3_32(keys: torch.Tensor, seed: int) -> torch.Tensor:
     """Murmur3 hash for int32 keys. Returns int64 to preserve full uint32 range."""
     c1, c2 = 0xCC9E2D51, 0x1B873593
@@ -70,6 +71,8 @@ def _batched_murmur3_32(keys: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor
     return h
 
 
+# _normal/_batched_normal are kept separate deliberately — consensus
+# bit-compat; do not unify without a cross-validator bit-compat harness.
 def _batched_normal(seeds: list, n: int, device: torch.device) -> torch.Tensor:
     """Generate batched normal random numbers for multiple seeds.
 
@@ -171,22 +174,6 @@ def generate_inputs_concat_murmur(
         result[i] = flat.view(seq_len, dim).to(dtype)
 
     return result
-
-
-def generate_target(
-    block_hash: str,
-    public_key: str,
-    dim: int,
-    device: torch.device,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """Generate deterministic target unit vector."""
-    seed_str = f"{block_hash}_{public_key}_target"
-    seed = _seed_from_string(seed_str)
-    normal = _normal(seed, dim, device)
-    target = normal.to(dtype)
-    target = target / target.norm()
-    return target
 
 
 def generate_householder_vector(

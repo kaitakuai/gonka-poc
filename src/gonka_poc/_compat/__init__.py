@@ -94,11 +94,9 @@ def _current_impl() -> ModuleType:
 def current() -> ModuleType:
     """Return the compat submodule matching the installed vllm minor.
 
-    Consumers MUST call this -- ``from gonka_poc._compat import current as compat``
-    used to bind the lru_cache-wrapped function object directly, which made
-    subsequent ``compat.build_common_attention_metadata(...)`` lookups raise
-    ``AttributeError`` because functions do not carry arbitrary attributes.
-    The contract is now: ``compat = current(); compat.<symbol>(...)``.
+    Consumers MUST call this: ``compat = current(); compat.<symbol>(...)``
+    -- see the module docstring's History note for why no other form is
+    supported.
     """
     return _current_impl()
 

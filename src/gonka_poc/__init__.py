@@ -20,10 +20,16 @@ here -- see ``MIGRATION_FROM_FORK.md`` for the disposition of every commit
 from the source branch.
 """
 
-__version__ = "0.1.0a0"
+# Single source of truth for the version is pyproject.toml; derive it so a
+# version bump cannot leave a stale literal behind.
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("gonka-poc")
+except Exception:  # pragma: no cover - not installed (e.g. source checkout)
+    __version__ = "unknown"
 
 # Set to True by :func:`gonka_poc.plugin.register` (the
-# ``vllm.general_plugins`` entry point) so a FastAPI startup hook can detect
+# ``vllm.general_plugins`` entry point) so ``PoCGatingMiddleware`` can detect
 # "plugin loaded but no gate attached" (operator likely ran plain
 # ``vllm serve`` instead of ``gonka-vllm-serve``).
 PLUGIN_LOADED: bool = False

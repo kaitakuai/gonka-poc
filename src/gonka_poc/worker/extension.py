@@ -50,7 +50,7 @@ from typing import Any, Dict, List, Optional
 # ``gonka_poc._compat`` is intentionally light (pure-Python dispatcher) so
 # it's safe to import at module scope; routing kv_caches access through the
 # shim keeps the documented private-API touchpoint policy honest.
-from gonka_poc._compat import current as _current
+from gonka_poc._compat import current as _compat_current
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ def unlocked_moe_workspace():
     # version-dispatched compat shim (the only place allowed to reach into
     # ``vllm.v1.*``). Older shims / non-0.23 vLLM simply lack these attributes.
     try:
-        compat = _current()
+        compat = _compat_current()
     except Exception:  # vLLM unavailable or version unmapped — nothing to do
         compat = None
     unlock = getattr(compat, "unlock_moe_workspace", None)
@@ -228,8 +228,6 @@ class PoCWorkerExtension:
         Conservative: ignores the size criterion, so a config that would
         only sometimes select scratch still reports scratch_capable=True.
         """
-        from gonka_poc._compat import current as _compat_current
-
         try:
             kv_caches = _compat_current().get_kv_cache_pool(self.model_runner)
             dtype = self.model_config.dtype
@@ -250,10 +248,15 @@ class PoCWorkerExtension:
         """Cheap health probe; returns rank metadata without touching GPU."""
         # ``self.rank``, ``self.device``, ``self.vllm_config`` are all set by
         # the GPU Worker before extensions are usable.
+        try:
+            import importlib.metadata as _md
+            gonka_poc_version = _md.version("gonka-poc")
+        except Exception:
+            gonka_poc_version = "unknown"
         return {
             "rank": int(getattr(self, "rank", -1)),
             "device": str(getattr(self, "device", "?")),
-            "ext_version": "gonka_poc/0.1.0a0",
+            "ext_version": f"gonka_poc/{gonka_poc_version}",
         }
 
     def execute_poc_describe_kv(self) -> Dict[str, Any]:
@@ -270,7 +273,7 @@ class PoCWorkerExtension:
         """
         if not hasattr(self, "model_runner"):
             return {"available": False}
-        compat = _current()
+        compat = _compat_current()
         try:
             kv_caches = compat.get_kv_cache_pool(self.model_runner)
         except RuntimeError:

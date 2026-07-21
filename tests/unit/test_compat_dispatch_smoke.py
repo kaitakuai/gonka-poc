@@ -120,7 +120,7 @@ def test_current_is_cached() -> None:
 def test_poc_model_runner_imports_cleanly() -> None:
     """Importing ``gonka_poc.poc.poc_model_runner`` MUST NOT crash.
 
-    The runner imports ``current as _current_compat`` at module load; a
+    The runner imports ``current as _compat_current`` at module load; a
     future refactor that re-binds ``current`` to something un-callable at
     *import* time (rather than at first call) would otherwise only surface
     on real hardware during the first PoC forward. Catch it here in 0.5s.

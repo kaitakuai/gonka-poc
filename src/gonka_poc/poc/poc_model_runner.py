@@ -8,7 +8,7 @@ Private-API touchpoint policy
 -----------------------------
 All ``vllm.v1.*`` private surfaces are routed through the version-dispatched
 compat shim. The import binds the resolver function and each consumer calls
-it to obtain the actual module: ``compat = _current_compat();
+it to obtain the actual module: ``compat = _compat_current();
 compat.build_common_attention_metadata(...)``. Touchpoints:
     * ``CommonAttentionMetadata`` construction
     * per-group ``AttentionMetadata`` construction (iteration over
@@ -43,7 +43,7 @@ from vllm.forward_context import set_forward_context
 from vllm.sequence import IntermediateTensors
 from vllm.logger import init_logger
 
-from gonka_poc._compat import current as _current_compat
+from gonka_poc._compat import current as _compat_current
 
 from .gpu_random import (
     generate_inputs,
@@ -75,9 +75,8 @@ def _ensure_layer_hooks(worker, block_hash, hidden_size):
         if existing_hook.block_hash == block_hash:
             return
         existing_hook.detach()
-    hook = LayerHouseholderHook(model, block_hash, device, hidden_size)
-    hook._setup(model, block_hash, device, hidden_size)
-    worker._poc_layer_hooks = hook
+    worker._poc_layer_hooks = LayerHouseholderHook(
+        model, block_hash, device, hidden_size)
 
 
 def _borrowed_layout(
@@ -172,7 +171,7 @@ def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions,
     model forward); DeepSeek-V4's C128A metadata builder requires it, every
     other v0.23 backend ignores ``cm.positions``.
     """
-    compat = _current_compat()
+    compat = _compat_current()
     total_tokens = batch_size * seq_len
 
     query_start_loc_gpu = (
@@ -405,7 +404,7 @@ def execute_poc_forward(
         # fleet requires reproducing the quirk, not fixing it.
         kv_scratch = None
         if borrowed_block_ids is None:
-            compat = _current_compat()
+            compat = _compat_current()
             try:
                 kv_caches = compat.get_kv_cache_pool(worker.model_runner)
             except RuntimeError:

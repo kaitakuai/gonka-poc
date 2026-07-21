@@ -64,35 +64,6 @@ def attach_poc_router(app: FastAPI) -> None:
     app.include_router(poc_router)
 
 
-def register_gate_presence_warning(app: FastAPI) -> None:
-    """Compatibility shim -- the gate-presence warning is now driven by
-    :class:`PoCGatingMiddleware` on first HTTP dispatch.
-
-    Background: this function used to attach a ``@app.on_event("startup")``
-    handler. vLLM 0.23.0 ``build_app`` constructs
-    ``FastAPI(lifespan=lifespan)`` (see ``api_server.py``). Starlette
-    silently ignores ``on_event`` handlers when a ``lifespan`` is supplied
-    -- FastAPI deprecated this pattern in 0.93 -- so the warning never
-    fired in production.
-
-    Rather than thread a brittle "wrap the lifespan" contextmanager through
-    both the bare-``vllm serve`` plugin path and our own entrypoint, we
-    moved the check into :class:`PoCGatingMiddleware` (one-shot on first
-    request). This shim is kept so external callers (notably
-    :func:`gonka_poc.plugin._install_build_app_warning_wrapper`) continue
-    to compile; it is intentionally a no-op.
-
-    Note: in the bare-``vllm serve`` case there is no gating middleware
-    installed either, so the warning path now travels through whatever
-    middleware vLLM itself wires up. The plugin's build_app wrapper has
-    been updated to install a minimal warning-only middleware in that
-    scenario -- see :func:`gonka_poc.plugin._install_build_app_warning_wrapper`.
-    """
-    # Intentionally empty. See docstring above for the rationale and the
-    # replacement path (PoCGatingMiddleware._maybe_warn_missing_gate).
-    del app  # unused
-
-
 def build_gonka_app(
     app: FastAPI,
     *,
@@ -134,10 +105,8 @@ def build_gonka_app(
     app.middleware_stack = None
     app.add_middleware(PoCGatingMiddleware, gate=gate, blocked_prefixes=prefixes)
 
-    # Register the startup-event hook AFTER the gate is attached. Here it is
-    # a defensive no-op (gate IS present), but the same callback installed by
-    # the plugin's ``build_app`` wrapper fires in the bare-``vllm serve`` case.
-    register_gate_presence_warning(app)
+    # The "plugin loaded but no gate attached" warning is carried by
+    # PoCGatingMiddleware._maybe_warn_missing_gate (one-shot on first dispatch).
 
     return app
 

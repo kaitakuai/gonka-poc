@@ -100,11 +100,8 @@ class PoCGatingMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # One-shot gate-presence check. Fires on first HTTP request because the
-        # FastAPI ``on_event("startup")`` hook is silently dropped under
-        # ``FastAPI(lifespan=...)`` (which is what upstream ``build_app`` uses).
-        # This is the only place we can both (a) see ``app.state`` and (b) be
-        # guaranteed to run regardless of which lifespan path was wired up.
+        # One-shot gate-presence check on first HTTP request -- see the class
+        # docstring for why this cannot be a startup event.
         if not self._gate_check_done:
             self._gate_check_done = True
             self._maybe_warn_missing_gate(scope)
@@ -112,10 +109,8 @@ class PoCGatingMiddleware:
         if self.gate.is_active():
             path: str = scope.get("path", "")
             if any(path.startswith(prefix) for prefix in self.blocked_prefixes):
-                # Derive both header (delta-seconds) and body (milliseconds)
-                # from the single PoCGate.RETRY_AFTER_SECONDS constant so
-                # the two cannot drift. Previous code had header "1" (sec)
-                # but body "100" (ms) -- a 10x mismatch.
+                # Header (delta-seconds) and body (ms) both derive from
+                # PoCGate.RETRY_AFTER_SECONDS -- see its comment for why.
                 retry_after_seconds = PoCGate.RETRY_AFTER_SECONDS
                 response = JSONResponse(
                     status_code=503,

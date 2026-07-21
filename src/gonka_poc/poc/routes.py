@@ -1,6 +1,5 @@
 """PoC API routes for vLLM server."""
 import asyncio
-import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -10,11 +9,18 @@ from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 from vllm.logger import init_logger
-from gonka_poc._compat import current as _current
-from .config import PoCState
+from gonka_poc._compat import current as _compat_current
+from .config import (
+    GENERATION_ACTIVE_POLL_SEC,
+    POC_BATCH_SIZE_DEFAULT,
+    POC_GENERATE_CHUNK_TIMEOUT_SEC,
+    POC_MAX_QUEUED_NONCES,
+    POC_RPC_TIMEOUT_MS,
+    PoCState,
+)
 from .data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
 from .callbacks import CallbackSender
-from .generate_queue import GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES
+from .generate_queue import GenerateJob, get_queue, clear_queue
 from .reservation import (
     poc_reservation,
     poc_validation_available,
@@ -26,11 +32,9 @@ logger = init_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/pow", tags=["PoC"])
 
-POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5"))
-POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
-POC_CHAT_BUSY_BACKOFF_SEC = 0.05
-POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
-POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "32"))
+# Backoff after a collective_rpc timeout in the mining loop (value-preserving
+# rename of the former POC_CHAT_BUSY_BACKOFF_SEC * 2).
+POC_RPC_TIMEOUT_BACKOFF_SEC = 0.1
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
 
@@ -80,7 +84,7 @@ async def _execute_poc_forward_rpc(
         # clobbered). During mining the gate keeps the in-flight set empty,
         # so this is a cheap no-op there.
         try:
-            await _current().abort_all_requests(engine_client)
+            await _compat_current().abort_all_requests(engine_client)
         except Exception as exc:
             logger.warning("PoC pre-chunk abort failed: %s", exc)
 
@@ -305,12 +309,10 @@ async def _cancel_poc_tasks(app_id: int):
                 await tasks["gen_task"]
             except asyncio.CancelledError:
                 pass
-        # Cancel the callback aiohttp loop too. Previously this key was
-        # stored at init time but never read here -- the textbook
-        # store-but-not-read pattern. On re-init / shutdown the loop kept
-        # POSTing until the process died. stop_event is already set above;
-        # that should let run() exit cleanly, but cancel as a belt-and-
-        # braces measure for the mid-POST case.
+        # Cancel the callback aiohttp loop too -- on re-init / shutdown it
+        # would otherwise keep POSTing until the process died. stop_event is
+        # already set above; that should let run() exit cleanly, but cancel
+        # as a belt-and-braces measure for the mid-POST case.
         if tasks.get("callback_task"):
             cb_task = tasks["callback_task"]
             if not cb_task.done():
@@ -333,7 +335,6 @@ async def _compute_artifacts_chunk(
     k_dim: int,
     poc_stronger_rng: bool = False,
     timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
-    check_cancelled: Optional[callable] = None,
     lease: Optional[Dict[str, Any]] = None,
 ) -> List[Dict]:
     """Compute artifacts for a chunk via collective_rpc.
@@ -343,9 +344,6 @@ async def _compute_artifacts_chunk(
     legacy fallback (``lease is None``) the reservation layer has already
     aborted in-flight inference.
     """
-    if check_cancelled and check_cancelled():
-        raise RuntimeError("Cancelled")
-
     result = await _execute_poc_forward_rpc(
         engine_client,
         nonces=nonces,
@@ -409,7 +407,7 @@ async def _generation_loop(
                 if timeout_count == 1 or timeout_count % 10 == 0:
                     logger.warning(f"PoC timed out (#{timeout_count}), engine busy")
                 pending_nonces = nonces
-                await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC * 2)
+                await asyncio.sleep(POC_RPC_TIMEOUT_BACKOFF_SEC)
                 continue
 
             pending_nonces = None
@@ -471,7 +469,13 @@ def _get_gate(request: Request):
 
 @router.post("/init/generate")
 async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
-    logger.info(f"PoC /init/generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.group_id}, {body.n_groups}, {body.batch_size}, {body.params}, {body.url}, {body.poc_stronger_rng}")
+    logger.info(
+        f"PoC /init/generate: block_hash={body.block_hash} "
+        f"block_height={body.block_height} node={body.node_id}/{body.node_count} "
+        f"group={body.group_id}/{body.n_groups} batch_size={body.batch_size} "
+        f"url={bool(body.url)} poc_stronger_rng={body.poc_stronger_rng}"
+    )
+    logger.debug(f"PoC /init/generate full body: {body}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
     gate = _get_gate(request)
@@ -519,7 +523,7 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     # spawn and the _poc_tasks store does not orphan the aiohttp loop --
     # without this, CallbackSender.run() would keep hammering body.url
     # forever (no stop_event signal, no cancel, no termination short of
-    # a process restart). See v4 must-fix #5.
+    # a process restart).
     gate.activate("init-generate")
     try:
         if body.url:
@@ -531,8 +535,8 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
         # abort_all_requests() drains the in-flight set so PoC forwards run on
         # an exclusively-owned GPU. Ordering contract (ADR-0013): gate.activate
         # -> abort_all_requests -> spawn gen task. This depends on the compat
-        # dispatch shim (fix #1) for the `current()` module lookup.
-        compat = _current()
+        # dispatch shim for the `current()` module lookup.
+        compat = _compat_current()
         aborted = await compat.abort_all_requests(engine_client)
         logger.info(
             "PoC init: aborted %d in-flight requests before generation", aborted
@@ -598,7 +602,14 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
 
 @router.post("/generate")
 async def generate(request: Request, body: PoCGenerateRequest) -> dict:
-    logger.info(f"PoC /generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.nonces}, {body.params}, {body.batch_size}, {body.wait}, {body.url}, {body.validation}, {body.stat_test}, {body.poc_stronger_rng}")
+    logger.info(
+        f"PoC /generate: block_hash={body.block_hash} "
+        f"block_height={body.block_height} node={body.node_id}/{body.node_count} "
+        f"batch_size={body.batch_size} nonces={len(body.nonces)} "
+        f"wait={body.wait} validation={bool(body.validation)} "
+        f"url={bool(body.url)} poc_stronger_rng={body.poc_stronger_rng}"
+    )
+    logger.debug(f"PoC /generate full body: {body}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
     
@@ -615,13 +626,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     if not body.wait:
         queue = get_queue()
         queue.set_generation_active_check(_is_generation_active)
-        
-        if queue.queued_nonces + len(body.nonces) > POC_MAX_QUEUED_NONCES:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Queue full: {queue.queued_nonces} nonces queued, limit is {POC_MAX_QUEUED_NONCES}"
-            )
-        
+
         job = GenerateJob(
             request_id=str(uuid.uuid4()),
             engine_client=engine_client,
@@ -655,7 +660,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         return {"status": "queued", "request_id": request_id, "queued_count": len(body.nonces)}
     
     while _is_generation_active(app_id):
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(GENERATION_ACTIVE_POLL_SEC)
 
     total_nonces = len(body.nonces)
     n_chunks = (total_nonces + body.batch_size - 1) // body.batch_size
@@ -674,13 +679,13 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             chunk_idx = i // body.batch_size
 
             while _is_generation_active(app_id):
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(GENERATION_ACTIVE_POLL_SEC)
 
             try:
                 artifacts = await _compute_artifacts_chunk(
                     engine_client, chunk, body.block_hash, body.public_key,
                     body.params.seq_len, body.params.k_dim, body.poc_stronger_rng,
-                    POC_GENERATE_CHUNK_TIMEOUT_SEC, None,
+                    POC_GENERATE_CHUNK_TIMEOUT_SEC,
                     lease=lease,
                 )
                 computed_artifacts.extend(artifacts)
@@ -778,4 +783,4 @@ async def stop_round(request: Request) -> dict:
     gate = getattr(request.app.state, "gonka_gate", None)
     if gate is not None:
         gate.deactivate()
-    return {"status": "OK", "pow_status": {"status": "STOPPED"}}
+    return {"status": "OK", "pow_status": {"status": PoCState.STOPPED.value}}
