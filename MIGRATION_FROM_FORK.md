@@ -1,7 +1,11 @@
 # Migration from `mb/feat/port-pocv2-vllm-0.23.0` fork
 
-This document records the disposition of every commit on the source branch
-(branch `mb/feat/port-pocv2-vllm-0.23.0` of the `kaitakuai/vllm` fork). Three buckets:
+This document is a **historical record** of the 2026-06 port: it records the
+disposition of every commit on the source branch
+(branch `mb/feat/port-pocv2-vllm-0.23.0` of the `kaitakuai/vllm` fork).
+References to `mlnode-foundry` below name the deployment repo those commits
+moved to at port time; the plugin has **no build or runtime dependency** on
+it — deployment tooling is out of scope for this package. Three buckets:
 
 1. **Plugin** -- ported into this package (no upstream edits).
 2. **Foundry profile** -- belongs in `mlnode-foundry` (deployment defaults,

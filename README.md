@@ -4,10 +4,11 @@ Out-of-tree vLLM plugin implementing **Gonka Proof-of-Compute v2** for stock
 `vllm` 0.23.x / 0.25.x wheels. Ships as a Python package -- no fork, no source patches.
 
 > **Status (2026-07-21):** The package is **not yet on PyPI**; install
-> directly from git (see Quick start below). Production images since the
-> 0.23 foundry pipeline install `gonka-poc` via pip on top of the per-minor
-> residual wheel (`poc-sampler-residual-vX.YY` scheme, ADR-0014); vLLM 0.23
-> and 0.25.1 are supported. See `MIGRATION_FROM_FORK.md` Section 3 and
+> directly from git (see Quick start below). Production deployments install
+> `gonka-poc` via pip on top of the per-minor residual wheel
+> (`poc-sampler-residual-vX.YY` scheme, ADR-0014); vLLM 0.23
+> and 0.25.1 are supported. How images are built is out of scope for this
+> package: it depends only on a vLLM install. See `MIGRATION_FROM_FORK.md` Section 3 and
 > ADR-0014 for the two-artifact relationship.
 
 ## What it provides
@@ -274,8 +275,9 @@ tests/
 
 See `MIGRATION_FROM_FORK.md` for:
 
-* Foundry-profile deployment defaults (Dockerfile.overlay, engine-args.yaml,
-  CI workflows) -- these live in **mlnode-foundry**, not the plugin.
+* Deployment defaults (Dockerfiles, engine-args, image CI) -- these belong
+  to whatever pipeline builds and ships images, **never to the plugin**;
+  the plugin stays deployment-agnostic by design.
 * Sampler-stack residual (`vllm/v1/sample/*` edits) -- stays on the fork
   until upstream adds a sampler-stack hook.
 * Structured-output graceful-degradation patch -- stays on the fork
