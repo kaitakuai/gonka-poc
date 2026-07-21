@@ -5,7 +5,7 @@ inference shapes and LOCKS it before the PoC forward runs; the PoC forward's
 larger shape would then raise "Workspace is locked". The fix unlocks the
 workspace around the forward (via the ``_compat`` shim) and re-locks after.
 
-CPU-only: we replace the version-dispatched ``_current()`` with a fake compat
+CPU-only: we replace the version-dispatched ``_compat_current()`` with a fake compat
 module exposing ``unlock_moe_workspace`` / ``lock_moe_workspace`` — no real
 vllm needed (importing the extension module pulls only the light ``_compat``).
 """
@@ -22,7 +22,7 @@ def _fake_compat(monkeypatch, *, unlock, lock):
     compat = types.SimpleNamespace(
         unlock_moe_workspace=unlock, lock_moe_workspace=lock
     )
-    monkeypatch.setattr(ext, "_current", lambda: compat)
+    monkeypatch.setattr(ext, "_compat_current", lambda: compat)
 
 
 def test_unlocks_then_relocks(monkeypatch):
@@ -74,7 +74,7 @@ def test_unlock_raising_is_swallowed(monkeypatch):
 
 def test_compat_without_workspace_symbols_is_a_noop(monkeypatch):
     # older shim / vLLM < 0.23: compat module lacks the functions -> no-op.
-    monkeypatch.setattr(ext, "_current", lambda: types.SimpleNamespace())
+    monkeypatch.setattr(ext, "_compat_current", lambda: types.SimpleNamespace())
     ran = []
     with ext.unlocked_moe_workspace():
         ran.append("forward")
@@ -82,11 +82,11 @@ def test_compat_without_workspace_symbols_is_a_noop(monkeypatch):
 
 
 def test_current_dispatch_failure_is_a_noop(monkeypatch):
-    # _current() itself failing (vllm unavailable / version unmapped) -> no-op.
+    # _compat_current() itself failing (vllm unavailable / version unmapped) -> no-op.
     def _boom():
         raise RuntimeError("no vllm")
 
-    monkeypatch.setattr(ext, "_current", _boom)
+    monkeypatch.setattr(ext, "_compat_current", _boom)
     ran = []
     with ext.unlocked_moe_workspace():
         ran.append("forward")

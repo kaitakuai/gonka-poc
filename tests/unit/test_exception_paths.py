@@ -1,25 +1,23 @@
 """Exception-path unit tests for ``init_generate``'s gate-cleanup contract.
 
-Background -- the v3 architecture re-review (Stream B fixture issue) flagged
-that ``init_generate`` flips the PoC gate ON *before* it has a generation
-task whose done-callback would flip it OFF. If anything between
+``init_generate`` flips the PoC gate ON *before* it has a generation task
+whose done-callback would flip it OFF. If anything between
 ``gate.activate(...)`` and ``gen_task.add_done_callback(...)`` raises:
 
     gate.activate("init-generate")           # ON
-    compat = _current()                      # <-- may raise
+    compat = _compat_current()               # <-- may raise
     aborted = await compat.abort_all_requests(...)  # <-- may raise
     gen_task = asyncio.create_task(...)      # <-- may raise
 
-...the gate latches ON forever -- no task exists yet, so no done-callback
-ever fires the corresponding ``gate.deactivate()``. The HTTP server then
-503s every chat/completion request from that point on, with no way back.
-
-The Stream B fix wraps the three offending calls in a try/except that
-calls ``gate.deactivate()`` on any exception before re-raising. These
-tests pin that contract:
+...the gate would latch ON forever -- no task exists yet, so no
+done-callback ever fires the corresponding ``gate.deactivate()``. The HTTP
+server would then 503 every chat/completion request from that point on,
+with no way back. The production code therefore wraps the three offending
+calls in a try/except that calls ``gate.deactivate()`` on any exception
+before re-raising. These tests pin that contract:
 
   * test_init_generate_compat_raises_deactivates_gate
-        ``gonka_poc.poc.routes._current`` raises RuntimeError.
+        ``gonka_poc.poc.routes._compat_current`` raises RuntimeError.
         Expected: gate ends up DEACTIVATED, exception propagates.
 
   * test_init_generate_abort_raises_deactivates_gate
@@ -31,11 +29,6 @@ tests pin that contract:
         ``_generation_loop`` raises before yielding -- either path lands
         in the same try-block).
         Expected: gate ends up DEACTIVATED, exception propagates.
-
-If Stream B has landed, these tests pass. If Stream D landed first
-(this file with no production fix), every test fails -- and that IS the
-gate working: the failures localize the missing fix to one production
-path instead of a tail of integration symptoms.
 
 Why no ``vllm`` import / engine: the gate object is a pure-Python flag
 defined in ``gonka_poc.entrypoint.gating``; we mount a minimal FastAPI
@@ -66,7 +59,7 @@ from gonka_poc.entrypoint.gating import PoCGate  # noqa: E402
 # --------------------------------------------------------------------------- #
 # Fixture: a wired app that ``init_generate`` can run against.
 #
-# init_generate's prerequisites (from src/gonka_poc/poc/routes.py:423-503):
+# init_generate's prerequisites (from src/gonka_poc/poc/routes.py):
 #   * request.app.state.gonka_gate  -- PoCGate instance
 #   * request.app.state.engine_client  -- anything truthy (we use AsyncMock)
 #   * request.app.state.openai_serving_models / poc_deployed -- absent => skip
@@ -150,8 +143,8 @@ def _run(coro):
 def test_init_generate_compat_raises_deactivates_gate(
     app: FastAPI, gate: PoCGate
 ) -> None:
-    """``_current()`` raises => gate MUST be deactivated before the exception
-    propagates.
+    """``_compat_current()`` raises => gate MUST be deactivated before the
+    exception propagates.
 
     Failure here = the production try/except wrapper is missing or did not
     cover the compat-dispatch lookup. The HTTP server would 503 every chat
@@ -162,14 +155,16 @@ def test_init_generate_compat_raises_deactivates_gate(
     request = _make_request(app)
     body = _make_body()
 
-    with patch.object(routes, "_current", side_effect=RuntimeError("compat boom")):
+    with patch.object(
+        routes, "_compat_current", side_effect=RuntimeError("compat boom")
+    ):
         with pytest.raises(RuntimeError, match="compat boom"):
             _run(routes.init_generate(request, body))
 
     assert gate.is_active() is False, (
-        "Gate latched ON after _current() raised. The production code must "
-        "wrap activate -> _current -> abort -> create_task in a try/except "
-        "that calls gate.deactivate() on failure (see Stream B fix)."
+        "Gate latched ON after _compat_current() raised. The production code "
+        "must wrap activate -> _compat_current -> abort -> create_task in a "
+        "try/except that calls gate.deactivate() on failure."
     )
 
 
@@ -192,7 +187,7 @@ def test_init_generate_abort_raises_deactivates_gate(
         side_effect=RuntimeError("abort boom")
     )
 
-    with patch.object(routes, "_current", return_value=fake_compat):
+    with patch.object(routes, "_compat_current", return_value=fake_compat):
         with pytest.raises(RuntimeError, match="abort boom"):
             _run(routes.init_generate(request, body))
 
@@ -221,7 +216,7 @@ def test_init_generate_spawn_raises_deactivates_gate(
     fake_compat = MagicMock()
     fake_compat.abort_all_requests = AsyncMock(return_value=0)
 
-    with patch.object(routes, "_current", return_value=fake_compat):
+    with patch.object(routes, "_compat_current", return_value=fake_compat):
         with patch.object(
             routes.asyncio,
             "create_task",
@@ -241,17 +236,13 @@ def test_init_generate_exception_cancels_callback_task(
 ) -> None:
     """body.url set + later step raises => callback_task MUST be torn down.
 
-    v4 must-fix #5: ``init_generate`` used to spawn ``CallbackSender.run()``
-    BEFORE the try-block. If anything inside the try then raised, the except
-    branch deactivated the gate and re-raised -- but never set
-    ``stop_event`` and never cancelled the callback task. Result: an orphan
-    aiohttp loop kept POSTing to ``body.url`` until the process died.
-
-    The fix hoists the spawn INTO the try-block and, in the except, signals
-    stop_event + bounded-waits + cancels. This test pins that behaviour by
-    asserting the callback task is ``done()`` (cancelled or naturally
-    exited) after the exception unwinds. If the bug regresses the task
-    will still be running when the assertion fires.
+    ``init_generate`` must spawn ``CallbackSender.run()`` INSIDE the
+    try-block and, in the except branch, signal stop_event + bounded-wait +
+    cancel. Otherwise an orphan aiohttp loop keeps POSTing to ``body.url``
+    until the process dies. This test pins that behaviour by asserting the
+    callback task is ``done()`` (cancelled or naturally exited) after the
+    exception unwinds. If the bug regresses the task will still be running
+    when the assertion fires.
 
     Why patch ``CallbackSender``: a real ``CallbackSender.run()`` opens an
     ``aiohttp.ClientSession`` and starts hitting the network. We do not want
@@ -293,7 +284,7 @@ def test_init_generate_exception_cancels_callback_task(
     )
 
     with patch.object(routes, "CallbackSender", _FakeCallbackSender):
-        with patch.object(routes, "_current", return_value=fake_compat):
+        with patch.object(routes, "_compat_current", return_value=fake_compat):
             with pytest.raises(RuntimeError, match="abort boom"):
                 _run(routes.init_generate(request, body))
 

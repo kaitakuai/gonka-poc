@@ -38,7 +38,7 @@ import weakref
 from contextlib import asynccontextmanager
 from typing import Any, Optional, Tuple
 
-from gonka_poc._compat import current as _current_compat
+from gonka_poc._compat import current as _compat_current
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ async def poc_validation_available(engine_client: Any) -> bool:
         cached = None
     if cached is not None:
         return cached
-    compat = _current_compat()
+    compat = _compat_current()
     available = False
     try:
         ranks = await engine_client.collective_rpc(
@@ -116,7 +116,7 @@ async def _borrow_with_retry(
     surface itself failed (feature not installed / transport error) — the
     caller must NOT keep polling or escalating for a better answer.
     """
-    compat = _current_compat()
+    compat = _compat_current()
     while True:
         try:
             lease = await compat.borrow_poc_blocks(
@@ -155,7 +155,7 @@ async def reserve_poc_blocks(
     if lease is not None:
         return lease
 
-    compat = _current_compat()
+    compat = _compat_current()
     try:
         aborted = await compat.abort_all_requests(engine_client)
     except Exception as exc:
@@ -204,7 +204,7 @@ async def poc_reservation(
             # out of the clobber range.
             lease = None
             try:
-                await _current_compat().abort_all_requests(engine_client)
+                await _compat_current().abort_all_requests(engine_client)
             except Exception as exc:
                 logger.error("PoC legacy-path abort failed: %s", exc)
         try:
@@ -222,7 +222,7 @@ async def _return_lease_with_retry(engine_client: Any, lease: dict) -> None:
     block_ids = lease["block_ids"]
     for attempt in range(3):
         try:
-            await _current_compat().return_poc_blocks(engine_client, block_ids)
+            await _compat_current().return_poc_blocks(engine_client, block_ids)
             return
         except Exception as exc:
             logger.warning(

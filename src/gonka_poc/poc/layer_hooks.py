@@ -3,7 +3,7 @@
 Applies transformations between transformer layers to break
 the model learned output structure.
 
-PATCHED: Replaced ContextVar with simple global bool for torch.compile compatibility.
+The active-flag is a simple global bool rather than a ContextVar because
 torch.compile/dynamo cannot trace ContextVar.get() calls.
 """
 from contextlib import contextmanager
@@ -13,8 +13,7 @@ import torch
 
 from .gpu_random import generate_householder_vector, apply_householder
 
-# Simple global flag instead of ContextVar (dynamo-compatible)
-# Safe because PoC forward is synchronous and single-threaded
+# Safe as a plain global: the PoC forward is synchronous and single-threaded.
 _poc_forward_active_flag: bool = False
 
 
@@ -52,6 +51,15 @@ class LayerHouseholderHook:
         self.reflection_vectors: List[torch.Tensor] = []
         self.block_hash = block_hash
 
+        layers = self._find_layers(model)
+        for i in range(len(layers)):
+            seed_str = f"{block_hash}_layer_{i}_householder"
+            v = generate_householder_vector(seed_str, hidden_size, device)
+            self.reflection_vectors.append(v)
+
+            hook = layers[i].register_forward_hook(self._create_hook(i))
+            self.hooks.append(hook)
+
     def _find_layers(self, model: torch.nn.Module) -> List[torch.nn.Module]:
         """Find transformer layers in a model-agnostic way."""
         if hasattr(model, "model") and hasattr(model.model, "layers"):
@@ -62,30 +70,10 @@ class LayerHouseholderHook:
             return list(model.layers)
         return []
 
-    def _setup(
-        self,
-        model: torch.nn.Module,
-        block_hash: str,
-        device: torch.device,
-        hidden_size: int,
-    ):
-        """Setup hooks on all transformer layers."""
-        layers = self._find_layers(model)
-        self.num_total_layers = len(layers)
-
-        for i in range(len(layers)):
-            seed_str = f"{block_hash}_layer_{i}_householder"
-            v = generate_householder_vector(seed_str, hidden_size, device)
-            self.reflection_vectors.append(v)
-
-            hook = layers[i].register_forward_hook(self._create_hook(i))
-            self.hooks.append(hook)
-
     def _create_hook(self, layer_idx: int):
         """Create a forward hook that applies Householder reflection.
 
         Hook only transforms when poc_forward_context is active.
-        Uses simple global bool check instead of ContextVar for dynamo compat.
         """
         def hook(module, input, output):
             if not is_poc_forward_active():
@@ -120,8 +108,3 @@ class LayerHouseholderHook:
             hook.remove()
         self.hooks = []
         self.reflection_vectors = []
-
-    @property
-    def num_layers(self) -> int:
-        """Number of layers with hooks attached."""
-        return len(self.hooks)
