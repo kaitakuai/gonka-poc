@@ -1,9 +1,10 @@
 """Version-dispatched compat shim isolating private vLLM API touchpoints.
 
-The plugin is officially pinned to vllm>=0.23.0,<0.24 in ``pyproject.toml``.
-Within that range some private structures (CommonAttentionMetadata,
-kv_caches layout, internal model_runner attributes) may shift; we localise
-every such touchpoint inside one of the ``vN_M.py`` modules in this package.
+The plugin is pinned in ``pyproject.toml`` to the vllm minors registered in
+:data:`_DISPATCH`. Across those minors some private structures
+(CommonAttentionMetadata, kv_caches layout, internal model_runner attributes)
+may shift; we localise every such touchpoint inside one of the ``vN_M.py``
+modules in this package.
 
 Selection happens LAZILY -- the first call to :func:`current` imports the
 matching submodule. This keeps test / lint discovery from forcing a real

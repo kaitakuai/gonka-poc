@@ -16,7 +16,7 @@ import pytest
 
 from tests.gonka.live_conftest import (
     BASE_URL, MODEL, require_server, stop_poc,
-    chat_request, build_enforced_tokens, extract_result, distance2,
+    build_enforced_tokens, extract_result, distance2,
 )
 
 

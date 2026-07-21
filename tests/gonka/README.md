@@ -5,35 +5,21 @@ of Computation (PoC) generation/validation, inference validation with
 enforced tokens, chat priority gating, grammar graceful degradation, and
 `logprobs_mode` behaviour.
 
-> **Post-refactor note (2026-06-17).** This directory used to live inside
-> the `kaitakuai/vllm` fork and was invoked as `python3 -m
-> vllm.entrypoints.openai.api_server ...` against a custom-built image.
-> After the plugin extraction (ADR-0013), the operator entry point is
-> `gonka-vllm-serve` from `pip install gonka-poc`, the fork-only
-> `Dockerfile.quick` no longer exists in this repo (it survives on the
-> residual sampler fork — see ADR-0014), and `test_chat_priority_gating.py`
-> was deleted in PR #5. Old fork-style instructions have been removed
-> below.
-
 ---
 
 ## Test Files
 
 ### Unit Tests (no server required)
 
-These live in `tests/unit/` and `tests/gonka/`. None of them need a GPU
-or a running vLLM server. CPU-only, fast, run on every CI bump.
+These live in `tests/unit/`. None of them need a GPU or a running vLLM
+server. CPU-only, fast, run on every CI bump. See `tests/unit/` for the
+current set of files — each module docstring says what it covers.
 
-| File | Location | What it tests |
-|------|----------|---------------|
-| `test_gating.py` | `tests/unit/` | `gonka_poc.entrypoint.gating.PoCGatingMiddleware` — activate the gate, assert `/v1/chat/completions` and `/v1/completions` return 503 with `Retry-After`; deactivate, assert 200. Replaces the deleted `test_chat_priority_gating.py` (pre-refactor module-global flag + AsyncLLM monkey-patch). |
-| `test_compat_dispatch_smoke.py` | `tests/unit/` | `gonka_poc._compat.current()` returns a *module* (not a function); the full `_compat/v0_23.py::__all__` attribute surface is reachable through the dispatch shim. Catches the regression where `current` was wrongly bound as an `lru_cache`-wrapped function. |
-| `test_grammar_graceful_degradation.py` | `tests/gonka/` | Grammar FSM graceful degradation with a mocked xgrammar backend. CPU-only logic test of the structured-output failure path. |
-
-There is also a vLLM private-surface drift detector at
-`tests/contract/test_v0_23_api_surface.py` — pins the upstream symbols
-`gonka_poc._compat.v0_23` depends on (class names, dataclass fields,
-method signatures). Run on every vLLM pin bump.
+There are also vLLM private-surface drift detectors at
+`tests/contract/test_v0_23_api_surface.py` and
+`tests/contract/test_v0_25_api_surface.py` — they pin the upstream
+symbols the `gonka_poc._compat.v0_23` and `v0_25` shims depend on (class
+names, dataclass fields, method signatures). Run on every vLLM pin bump.
 
 ### Live Tests (require running `gonka-vllm-serve`)
 
@@ -61,8 +47,8 @@ method signatures). Run on every vLLM pin bump.
 No GPU, no running server. From the repo root:
 
 ```bash
-pip install -e '.[dev]'   # or:  pip install git+https://github.com/kaitakuai/gonka-poc@main
-pytest tests/unit tests/contract tests/gonka/test_grammar_graceful_degradation.py -v
+pip install -e '.[test]'   # or:  pip install git+https://github.com/kaitakuai/gonka-poc@main
+pytest tests/unit tests/contract -v
 ```
 
 `tests/contract/` and `tests/unit/test_compat_dispatch_smoke.py` import

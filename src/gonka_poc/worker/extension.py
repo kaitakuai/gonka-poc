@@ -240,55 +240,6 @@ class PoCWorkerExtension:
         return {"scratch_capable": bool(scratch_capable),
                 "rank": int(getattr(self, "rank", -1))}
 
-    # ------------------------------------------------------------------ #
-    # Diagnostic / liveness pings (cheap, no GPU)
-    # ------------------------------------------------------------------ #
-
-    def execute_poc_ping(self) -> Dict[str, Any]:
-        """Cheap health probe; returns rank metadata without touching GPU."""
-        # ``self.rank``, ``self.device``, ``self.vllm_config`` are all set by
-        # the GPU Worker before extensions are usable.
-        try:
-            import importlib.metadata as _md
-            gonka_poc_version = _md.version("gonka-poc")
-        except Exception:
-            gonka_poc_version = "unknown"
-        return {
-            "rank": int(getattr(self, "rank", -1)),
-            "device": str(getattr(self, "device", "?")),
-            "ext_version": f"gonka_poc/{gonka_poc_version}",
-        }
-
-    def execute_poc_describe_kv(self) -> Dict[str, Any]:
-        """Report KV-cache tensor shape/dtype for the compat shim to verify.
-
-        Returns a small dict only; do NOT return the tensors themselves.
-
-        Routes through ``compat.get_kv_cache_pool`` (instead of raw
-        ``getattr``) so every kv_caches access in the package goes through
-        the documented shim. The shim raises ``RuntimeError`` when the
-        attribute is missing/None; we translate that into the existing
-        ``{"available": False}`` diagnostic shape so callers (CLI probes,
-        contract tests) keep working unchanged.
-        """
-        if not hasattr(self, "model_runner"):
-            return {"available": False}
-        compat = _compat_current()
-        try:
-            kv_caches = compat.get_kv_cache_pool(self.model_runner)
-        except RuntimeError:
-            return {"available": False}
-        if not kv_caches:
-            return {"available": True, "n_layers": 0}
-        head = kv_caches[0]
-        return {
-            "available": True,
-            "n_layers": len(kv_caches),
-            "head_shape": list(getattr(head, "shape", ())),
-            "head_dtype": str(getattr(head, "dtype", "?")),
-            "head_device": str(getattr(head, "device", "?")),
-        }
-
 
 # Public alias used in the ``--worker-extension-cls`` CLI string.
 __all__ = ["PoCWorkerExtension"]

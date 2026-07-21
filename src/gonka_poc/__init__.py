@@ -1,7 +1,7 @@
 """gonka-poc: out-of-tree vLLM plugin for Gonka Proof-of-Compute (PoC v2).
 
 This package ships as a standalone pip-installable plugin that targets a stock
-``vllm==0.23.*`` wheel. It provides three integration surfaces:
+vllm wheel (0.23.x / 0.25.x). It provides three integration surfaces:
 
 1. ``vllm.general_plugins`` entry point (:func:`gonka_poc.plugin.register`)
    that sets a process-local ``PLUGIN_LOADED`` flag and installs a one-shot
@@ -9,8 +9,7 @@ This package ships as a standalone pip-installable plugin that targets a stock
    gate-presence warning fires when the operator runs ``vllm serve`` instead
    of ``gonka-vllm-serve``.
 2. ``--worker-extension-cls gonka_poc.worker.PoCWorkerExtension`` exposing
-   ``execute_poc_forward`` to vLLM's ``collective_rpc`` (replaces the previous
-   monkey-patch against ``vllm.v1.engine.async_llm.AsyncLLM``).
+   ``execute_poc_forward`` to vLLM's ``collective_rpc``.
 3. ``gonka-vllm-serve`` console script that composes a FastAPI app on top of
    the stock vLLM OpenAI-compatible server, attaching the PoC API router and a
    503/abort gating middleware.

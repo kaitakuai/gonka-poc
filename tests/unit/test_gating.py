@@ -1,11 +1,8 @@
 """Unit tests for ``gonka_poc.entrypoint.gating.PoCGatingMiddleware``.
 
-Replaces the deleted ``tests/gonka/test_chat_priority_gating.py``, which had
-been written against a pre-refactor architecture (module-global flag +
-AsyncLLM monkey-patching). The new gate lives entirely in the ASGI
-middleware ``PoCGatingMiddleware`` + the ``PoCGate`` flag object; we
-exercise it directly via a Starlette test client mounted on a minimal
-FastAPI app.
+The gate lives entirely in the ASGI middleware ``PoCGatingMiddleware`` +
+the ``PoCGate`` flag object; we exercise it directly via a Starlette test
+client mounted on a minimal FastAPI app.
 
 No vllm, no engine, no monkey-patching: this test stays CPU-only and runs
 on the same wheel as the contract tests but does not need vllm imported.
@@ -42,7 +39,7 @@ def test_middleware_api_surface_unchanged() -> None:
     """
     gate = PoCGate()
     # PoCGate.is_active / activate / deactivate are sync (verified in
-    # src/gonka_poc/entrypoint/gating.py:42-51).
+    # src/gonka_poc/entrypoint/gating.py).
     assert callable(gate.is_active)
     assert callable(gate.activate)
     assert callable(gate.deactivate)

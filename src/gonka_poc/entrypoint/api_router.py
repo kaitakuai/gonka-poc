@@ -1,4 +1,4 @@
-"""``gonka-vllm-serve`` -- compose a FastAPI app on top of stock vLLM 0.23.
+"""``gonka-vllm-serve`` -- compose a FastAPI app on top of stock vLLM (0.23.x / 0.25.x).
 
 This is a thin wrapper around the upstream public API:
 
@@ -12,8 +12,8 @@ This is a thin wrapper around the upstream public API:
 
 We do NOT patch any vLLM source file. We only:
   1. Build the stock FastAPI app via ``build_app(args, ...)``.
-  2. Attach our PoC router (``vllm/poc/routes.py`` ported into
-     ``gonka_poc.poc.routes``) via ``app.include_router(...)``.
+  2. Attach our PoC router (``gonka_poc.poc.routes``) via
+     ``app.include_router(...)``.
   3. Install ``PoCGatingMiddleware`` AFTER ``build_app`` returns so it ends up
      OUTERMOST in Starlette's reverse-insertion order, gating the
      ``/v1/chat/completions`` and ``/v1/completions`` routes with 503 when PoC
@@ -56,7 +56,7 @@ def _interrupt_init(signum: int, frame: Any) -> None:  # pragma: no cover - sign
 
 
 def attach_poc_router(app: FastAPI) -> None:
-    """Attach the PoC API router (ported from ``vllm/poc/routes.py``)."""
+    """Attach the PoC API router (``gonka_poc.poc.routes``)."""
     # Imported lazily because gonka_poc.poc.* pulls vllm.logger which itself
     # requires a configured vllm runtime.
     from gonka_poc.poc.routes import router as poc_router

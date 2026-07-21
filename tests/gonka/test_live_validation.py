@@ -14,13 +14,11 @@ Tests:
   9. Enforced replay text matches original
   10. Long sequence replay → distance stays small
 """
-import json
 import time
-import httpx
 import pytest
 
 from tests.gonka.live_conftest import (
-    BASE_URL, MODEL, require_server, stop_poc,
+    require_server, stop_poc,
     chat_request, build_enforced_tokens, extract_result, distance2,
 )
 

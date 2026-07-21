@@ -55,11 +55,7 @@ class CallbackSender:
         """Clear all buffered artifacts."""
         self._buffer.clear()
         self._pending_payload = None
-    
-    @property
-    def buffered_count(self) -> int:
-        return len(self._buffer)
-    
+
     async def run(self):
         """Main sender loop - batches and sends with retry-until-stop."""
         last_send_time = time.time()
@@ -156,14 +152,6 @@ class CallbackQueue:
             self._dropped_count += 1
             if self._dropped_count == 1 or self._dropped_count % 100 == 0:
                 logger.warning(f"Callback queue full, dropped {self._dropped_count} callbacks total")
-
-    @property
-    def pending_count(self) -> int:
-        return len(self._queue)
-
-    @property
-    def active_count(self) -> int:
-        return len(self._active_tasks)
 
     async def start(self):
         """Start the callback worker."""

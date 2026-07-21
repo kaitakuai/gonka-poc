@@ -54,13 +54,6 @@ gonka-vllm-serve = "gonka_poc.entrypoint.api_router:main"
 where = ["src"]
 include = ["gonka_poc*"]
 
-[tool.setuptools.package-data]
-"gonka_poc" = ["py.typed"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-markers = [
-  "live: requires a running vllm server (skipped by default in CI without GPU)",
-  "contract: read-only vllm API drift detector",
-]

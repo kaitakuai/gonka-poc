@@ -8,8 +8,8 @@
 
 The plugin's `/api/v1/pow/generate` (validation) path never activated the
 gate nor aborted inference, yet its forward overwrote KV blocks `0..N` —
-silent corruption of live inference KV, the exact failure mode Gleb warned
-about. Upstream solved it for the in-tree fork by *borrowing* free blocks
+a known silent-corruption failure mode against live inference KV.
+Upstream solved it for the in-tree fork by *borrowing* free blocks
 from the BlockPool so validation and inference coexist; mining
 (`/init/generate`) keeps the abort-everything regime.
 

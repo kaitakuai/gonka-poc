@@ -1,8 +1,8 @@
 # ADR-0014 — Residual vLLM fork as permanent infrastructure (local stub)
 
-**Status:** Accepted (amends ADR-0013 §Layer-3). Canonical source lives in
-**mlnode-foundry** —
-[`docs/adr/0014-residual-fork-permanent-infra.md`](https://github.com/kaitakuai/mlnode-foundry/blob/main/docs/adr/0014-residual-fork-permanent-infra.md).
+**Status:** Accepted (amends ADR-0013 §Layer-3). Originated as
+mlnode-foundry ADR-0014 (kaitakuai internal); this file is authoritative
+for this repo.
 This file is a 1-page summary so an offline reader of the `gonka-poc` repo
 can find the rationale for the two-artifact (plugin + thin fork) shipping
 model without leaving the package.
@@ -23,8 +23,8 @@ model without leaving the package.
 why `test_chat_priority_gating.py` was deleted in the arch refactor. Without
 a local file, those citations are dead links. This stub closes the link-rot.
 The full options-considered narrative (status-quo, monkey-patch sampler,
-full-fork rebase, thin-fork-permanent) lives in the canonical mlnode-foundry
-ADR — do not duplicate it here.
+full-fork rebase, thin-fork-permanent) lived in the original mlnode-foundry
+ADR (kaitakuai internal) and is not duplicated here.
 
 ## Decision (the part the plugin's shipping model depends on)
 
@@ -51,6 +51,9 @@ bandwidth or acceptance channel to drive upstream PRs through the
 `vllm-project` review process. The thin fork is therefore treated as
 **permanent infrastructure**, not a temporary bridge.
 
+Status note: this decision was made under kaitakuai ownership
+(2026-06-16); revisit under gonka-ai ownership.
+
 ## What this means operationally
 
 - Per vLLM minor: rebuild the residual fork as
@@ -66,20 +69,13 @@ bandwidth or acceptance channel to drive upstream PRs through the
   fork commit go away. The shipping model survives the migration —
   consumers still install one plugin.
 
-## Why this lives in two places
+## Provenance
 
-- **Canonical:** mlnode-foundry owns the decision record (it covers
-  foundry overlay impact, the CI workflow on the residual branch,
-  REBASE.md procedure — all out of scope for the plugin source tree).
-- **Local stub:** the plugin README cites this ADR by number; we keep the
-  citation resolvable from inside the `gonka-poc` checkout. When
-  mlnode-foundry's ADR-0014 changes, update this stub's summary so they
-  stay coherent (drift risk acknowledged — bounded by the small surface
-  this stub copies).
+Originated as mlnode-foundry ADR-0014 (kaitakuai internal); this file is
+authoritative for this repo.
 
 ## Links
 
-- Canonical ADR: [mlnode-foundry/docs/adr/0014-residual-fork-permanent-infra.md](https://github.com/kaitakuai/mlnode-foundry/blob/main/docs/adr/0014-residual-fork-permanent-infra.md)
 - Residual fork branch: <https://github.com/kaitakuai/vllm/tree/poc-sampler-residual-v0.23>
 - Companion ADR: [ADR-0013](ADR-0013-poc-gate-ordering.md) (PoC gate
   ordering contract)

@@ -11,8 +11,6 @@ Tests:
 """
 import base64
 import struct
-import time
-import math
 import httpx
 import pytest
 import numpy as np

@@ -32,8 +32,7 @@ logger = init_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/pow", tags=["PoC"])
 
-# Backoff after a collective_rpc timeout in the mining loop (value-preserving
-# rename of the former POC_CHAT_BUSY_BACKOFF_SEC * 2).
+# Backoff after a collective_rpc timeout in the mining loop.
 POC_RPC_TIMEOUT_BACKOFF_SEC = 0.1
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}

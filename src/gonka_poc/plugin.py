@@ -79,9 +79,6 @@ def register() -> None:
             "gonka_poc.plugin.register: build_app warning wrapper install failed"
         )
 
-    # NOTE(layer-1): when gonka_poc.custom_ops lands, import it here so its
-    # OOT decorators run: `import gonka_poc.custom_ops  # noqa: F401`.
-
     try:
         from gonka_poc._compat import current as _compat_current
 

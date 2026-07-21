@@ -1,7 +1,7 @@
 # Migration from `mb/feat/port-pocv2-vllm-0.23.0` fork
 
 This document records the disposition of every commit on the source branch
-(`/tmp/vllm-0.23-branch @ mb/feat/port-pocv2-vllm-0.23.0`). Three buckets:
+(branch `mb/feat/port-pocv2-vllm-0.23.0` of the `kaitakuai/vllm` fork). Three buckets:
 
 1. **Plugin** -- ported into this package (no upstream edits).
 2. **Foundry profile** -- belongs in `mlnode-foundry` (deployment defaults,
@@ -12,6 +12,9 @@ This document records the disposition of every commit on the source branch
    plugin.
 
 ## 1. Plugin commits (already in this scaffold)
+
+*This table records the original port disposition; some destination modules
+were later refactored away (see git history).*
 
 | SHA | Subject | Destination in plugin |
 |-----|---------|-----------------------|
@@ -102,6 +105,5 @@ each vllm minor bump. Move to plugin only after an upstream PR adds a hook.
    structured-output residual.
 
 When all three land upstream the plugin becomes the single source of truth
-and the `kaitakuai/vllm` fork can be archived (per
-`feedback_hardware_validation_gate.md`, archive only after one quarter of
-clean hardware validation on stock wheels).
+and the `kaitakuai/vllm` fork can be archived (archive only after one
+quarter of clean hardware validation on stock wheels).

@@ -1,10 +1,10 @@
 # ADR-0013 — PoC gate / abort / spawn ordering contract (local stub)
 
-**Status:** Accepted. Canonical source lives in **mlnode-foundry** —
-[`docs/adr/0013-poc-integration-architecture.md`](https://github.com/kaitakuai/mlnode-foundry/blob/main/docs/adr/0013-poc-integration-architecture.md).
+**Status:** Accepted. Originated as mlnode-foundry ADR-0013 (kaitakuai
+internal); this file is authoritative for this repo.
 This file is a 1-page summary so an offline reader of the `gonka-poc` repo
-can find the rationale for the inline comment at
-`src/gonka_poc/poc/routes.py:468` without leaving the package.
+can find the rationale for the inline comment in `init_generate` in
+`src/gonka_poc/poc/routes.py` without leaving the package.
 
 **Date:** 2026-06-12 (canonical); local stub 2026-06-17.
 **Owners:** @baychak
@@ -21,8 +21,8 @@ can find the rationale for the inline comment at
 Without a local ADR file, that comment is a dead link for anyone reading the
 plugin source tree in isolation. This stub closes the link-rot. The full
 architectural justification (three-layer plugin / shim / upstream story,
-fork history, options considered) lives in the canonical mlnode-foundry
-ADR — do not duplicate it here.
+fork history, options considered) lived in the original mlnode-foundry
+ADR (kaitakuai internal) and is not duplicated here.
 
 ## Decision (the part the plugin code depends on)
 
@@ -51,16 +51,11 @@ Inverting any pair breaks the contract:
 `gen_task.add_done_callback` deactivates the gate when generation finishes
 (or is cancelled) — see `_on_generation_done` in the same function.
 
-## Why this lives in two places
+## Provenance
 
-- **Canonical:** mlnode-foundry owns the architectural decision record
-  (it covers more than just this plugin — image policy, foundry overlay,
-  contract tests across the four-stage pipeline).
-- **Local stub:** the plugin code cites this ADR by number; we keep the
-  citation resolvable from inside the `gonka-poc` checkout. When
-  mlnode-foundry's ADR-0013 changes, update this stub's summary so they
-  stay coherent (drift risk acknowledged — bounded by the small surface
-  this stub copies).
+Originated as mlnode-foundry ADR-0013 (kaitakuai internal); this file is
+authoritative for this repo. The Decision section above carries the full
+contract the plugin code depends on.
 
 ## Dependencies
 
@@ -72,7 +67,6 @@ Inverting any pair breaks the contract:
 
 ## Links
 
-- Canonical ADR: [mlnode-foundry/docs/adr/0013-poc-integration-architecture.md](https://github.com/kaitakuai/mlnode-foundry/blob/main/docs/adr/0013-poc-integration-architecture.md)
-- Source citing this ADR: `src/gonka_poc/poc/routes.py:468`
+- Source citing this ADR: `init_generate` in `src/gonka_poc/poc/routes.py`
 - Companion ADR: [ADR-0014](ADR-0014-plugin-vs-fork.md) (residual fork as
   permanent infrastructure)
